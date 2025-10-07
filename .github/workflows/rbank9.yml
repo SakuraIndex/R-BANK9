@@ -1,59 +1,30 @@
-name: R-BANK9 Intraday
+name: Run R-BANK9 intraday
 
 permissions:
   contents: write
 
 on:
-  workflow_dispatch:
   schedule:
-    # 平日 JST 09:05 / 11:35 / 15:35 に実行（分は少し遅らせてデータ反映待ち）
-    - cron: "5 0 * * 1-5"     # 09:05 JST
-    - cron: "35 2 * * 1-5"    # 11:35 JST
-    - cron: "35 6 * * 1-5"    # 15:35 JST
+    - cron: "35 6 * * *"   # 毎日 15:35 JST
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.10"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Run R-BANK9 intraday
         run: python src/rbank9_intraday.py
-
-      - name: Verify outputs exist
-        run: |
-          ls -la docs/outputs || true
-          test -f docs/outputs/rbank9_intraday.png
-          test -f docs/outputs/rbank9_intraday.csv
-          test -f docs/outputs/rbank9_post_intraday.txt
-
-      - name: Upload artifacts (debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: rbank9-outputs
-          path: docs/outputs/*
-
       - name: Commit and push outputs
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/* || true
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add docs/outputs/*
           if ! git diff --cached --quiet; then
-            git commit -m "Auto update: R-BANK9 intraday $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            git commit -m "Update R-BANK9 intraday snapshot"
             git push
-          else
-            echo "No changes to commit."
           fi
