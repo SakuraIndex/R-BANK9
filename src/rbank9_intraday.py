@@ -15,70 +15,91 @@ import matplotlib.pyplot as plt
 # ---------- 設定 ----------
 BASE_TZ = timezone(timedelta(hours=9))  # JST
 OUT_DIR = "docs/outputs"
-TICKER_FILE = "docs/tickers_rbank9.txt"   # 1行1ティッカー（例: 5830.T）
+TICKER_FILE = "docs/tickers_rbank9.txt"   # 5830.T などを1行1ティッカー
 
 IMG_PATH = os.path.join(OUT_DIR, "rbank9_intraday.png")
 CSV_PATH = os.path.join(OUT_DIR, "rbank9_intraday.csv")
 POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
 
-# yfinance の JP 現物は 1m が不安定なことがあるので 5m を既定に
+# JP は 1m が不安定なことがあるので 5m で安定運用
 INTRA_PERIOD = "7d"
-INTRA_INTERVAL = "5m"   # 1mで動くなら "1d"+"1m" でもOK
+INTRA_INTERVAL = "5m"
 
 # ---------- ユーティリティ ----------
 def jst_now() -> datetime:
     return datetime.now(BASE_TZ)
 
 def load_tickers(path: str) -> List[str]:
-    tickers: List[str] = []
+    xs: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            s = raw.strip()
+            if not s or s.startswith("#"):
                 continue
-            tickers.append(line)
-    return tickers
+            xs.append(s)
+    return xs
+
+def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
+    """
+    yfinance の Close が (N,), (N,1), (N,k) など何で来ても
+    1 次元 Series[float] に正規化する。
+    - すべて数値化（coerce）
+    - 複数列ある場合：有効データ点数が最大の列を採用
+    """
+    if isinstance(close_like, pd.Series):
+        ser = pd.to_numeric(close_like, errors="coerce").dropna()
+        return ser
+
+    # DataFrame -> 数値化 & 全欠損列を落とす
+    df = close_like.apply(pd.to_numeric, errors="coerce")
+    df = df.loc[:, df.notna().any(0)]
+    if df.shape[1] == 0:
+        raise ValueError("no numeric close column")
+
+    if df.shape[1] == 1:
+        ser = df.iloc[:, 0]
+    else:
+        # 有効データ点数が最も多い列を選ぶ
+        best_col = df.count().idxmax()
+        ser = df[best_col]
+
+    ser = ser.astype(float)
+    ser.index = index
+    ser = ser.dropna()
+    return ser
 
 def ensure_series_1dClose(df: pd.DataFrame) -> pd.Series:
-    """
-    df['Close'] を「1次元 Series」に安全に変換する。
-    （yfinanceの戻りが (N,1) ndarray になることがあるため）
-    """
     if "Close" not in df.columns:
-        raise ValueError("Close column not found.")
+        raise ValueError("Close column not found")
     close = df["Close"]
-    # DataFrame->Series の場合や、ndarray 形状を吸収
-    if isinstance(close, pd.DataFrame):
-        close = close.squeeze("columns")
-    if not isinstance(close, pd.Series):
-        close = pd.Series(close, index=df.index)
-    # 数値化＋欠損除去
-    close = pd.to_numeric(close, errors="coerce").dropna()
-    return close
+    # （MultiIndex/重複列/複数列）をすべて吸収して 1D 化
+    return _to_series_1d(close, df.index)
 
 def fetch_prev_close(ticker: str) -> float:
-    d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
+    d = yf.download(ticker, period="10d", interval="1d",
+                    auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"[WARN] prev close empty for {ticker}")
     s = ensure_series_1dClose(d)
-    # 前日終値（直近の1つ前）
-    if len(s) < 2:
-        # 1本しか無い場合は最後（今日）を前日としてみなさないように safety
-        return float(s.iloc[-1])
-    return float(s.iloc[-2])
+    # 前日終値（直近 1 本前）
+    if len(s) >= 2:
+        return float(s.iloc[-2])
+    return float(s.iloc[-1])
 
 def fetch_intraday_series(ticker: str) -> pd.Series:
-    d = yf.download(
-        ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
-        auto_adjust=False, progress=False
-    )
+    d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
+                    auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"[WARN] intraday empty for {ticker}")
     s = ensure_series_1dClose(d)
-    # 同一日のみ抽出（最後に近い営業日）: index が tz-aware の場合も想定
-    # 当日JSTの日付でフィルタ
-    last_day = pd.to_datetime(s.index[-1]).astimezone(BASE_TZ).date()
-    s = s[pd.to_datetime(s.index).tz_convert(BASE_TZ).date == last_day]
+
+    # 当日(JST)だけ抽出
+    idx = pd.to_datetime(s.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx = idx.tz_convert(BASE_TZ)
+    last_day = idx[-1].date()
+    s = s[(idx.date == last_day)]
     if s.empty:
         raise RuntimeError(f"[WARN] intraday filtered empty for {ticker}")
     return s
@@ -91,11 +112,8 @@ def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
             print(f"[INFO] Fetching {t} ...")
             prev = fetch_prev_close(t)
             intraday = fetch_intraday_series(t)
-
             pct = (intraday / prev - 1.0) * 100.0
-            pct = pct.rename(t)
-            rows.append(pct)
-
+            rows.append(pct.rename(t))
         except Exception as e:
             print(f"[WARN] skip {t}  # {e}")
 
@@ -103,34 +121,25 @@ def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
         raise RuntimeError("取得できた日中データが0でした。ティッカーを見直してください。")
 
     df = pd.concat(rows, axis=1).sort_index()
-    # 等ウェイト
     df["R_BANK9"] = df.mean(axis=1, skipna=True)
     return df
 
 # ---------- 可視化 ----------
 def pick_line_color(series: pd.Series) -> str:
-    """
-    終端がプラスなら青緑、マイナスなら赤
-    """
-    if len(series) == 0:
-        return "#00e5d7"
-    return "#00e5d7" if float(series.iloc[-1]) >= 0 else "#ff4d4d"
+    return "#00e5d7" if len(series) and float(series.iloc[-1]) >= 0 else "#ff4d4d"
 
 def plot_index(df: pd.DataFrame) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-
     series = df["R_BANK9"]
     c = pick_line_color(series)
 
     plt.close("all")
     fig = plt.figure(figsize=(16, 9), dpi=160)
     ax = fig.add_subplot(111)
-
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
-    for spine in ax.spines.values():
-        spine.set_color("#444444")
-
+    for sp in ax.spines.values():
+        sp.set_color("#444444")
     ax.plot(series.index, series.values, color=c, linewidth=3.0, label="R-BANK9")
     ax.axhline(0, color="#666666", linewidth=1.0)
     ax.tick_params(colors="white")
