@@ -52,7 +52,11 @@ def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
 
     # DataFrame -> 数値化 & 全欠損列を落とす
     df = close_like.apply(pd.to_numeric, errors="coerce")
-    df = df.loc[:, df.notna().any(0)]
+
+    # ❗ ここを any(0) から any(axis=0) に変更
+    mask = df.notna().any(axis=0)
+    df = df.loc[:, mask]
+
     if df.shape[1] == 0:
         raise ValueError("no numeric close column")
 
@@ -60,13 +64,14 @@ def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
         ser = df.iloc[:, 0]
     else:
         # 有効データ点数が最も多い列を選ぶ
-        best_col = df.count().idxmax()
+        best_col = df.count(axis=0).idxmax()
         ser = df[best_col]
 
     ser = ser.astype(float)
     ser.index = index
     ser = ser.dropna()
     return ser
+
 
 def ensure_series_1dClose(df: pd.DataFrame) -> pd.Series:
     if "Close" not in df.columns:
