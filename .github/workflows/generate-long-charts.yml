@@ -1,0 +1,41 @@
+name: Generate long-term charts (price + volume + SMA)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '40 6 * * *'  # JST 15:40
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      INDEX_KEY: astra4  # 各リポで変更（astra4 / scoin_plus / rbank9 / ain10）
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas matplotlib
+
+      - name: Generate charts (7d/1m/1y)
+        run: python scripts/long_charts.py
+
+      - name: Commit charts if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(charts): update long-term charts with SMA & volume"
+          file_pattern: |
+            docs/outputs/*_7d.png
+            docs/outputs/*_1m.png
+            docs/outputs/*_1y.png
+            docs/outputs/*_7d.csv
+            docs/outputs/*_1m.csv
+            docs/outputs/*_1y.csv
