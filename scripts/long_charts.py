@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Generate long-term charts (1d/7d/1m/1y) for Sakura Index series.
-- セッション/タイムゾーンは INDEX_KEY に応じて自動切替
+
+- セッション/タイムゾーンは INDEX_KEY で切替
 - 1d は 始値<終値: 青緑 / 始値>終値: 赤 / 同値: グレー
-- 値は「前日終値 = 100」へ正規化（履歴なければ当日先頭値=100でフォールバック）
 - 出来高があれば薄い棒で重ね描き
-出力: docs/outputs/<index_key>_{1d|7d|1m|1y}.png
+- データが空でも必ず PNG を保存（"No data" プレースホルダー）
+
+出力先: docs/outputs/<index_key>_{1d|7d|1m|1y}.png
 """
 
 import os
@@ -17,9 +19,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# ========================= 基本設定 =========================
-
 OUTPUT_DIR = "docs/outputs"
+
+# ログ（最低限）
+print(f"[long_charts] cwd={os.getcwd()}")
+print(f"[long_charts] OUTPUT_DIR={os.path.abspath(OUTPUT_DIR)}")
 
 # 色
 COLOR_PRICE_DEFAULT = "#ff99cc"  # 長期線
@@ -42,13 +46,24 @@ plt.rcParams.update({
 def log(msg: str):
     print(f"[long_charts] {msg}")
 
-# ===================== 市場プロファイル =====================
+# ------------------------------------------------------------
+# 市場プロファイル
+# ------------------------------------------------------------
 def market_profile(index_key: str):
     k = (index_key or "").lower()
 
-    # ...（米国系はそのまま）
+    # AIN-10（米国株をJST表示）
+    if k == "ain10":
+        return dict(
+            RAW_TZ_INTRADAY="America/New_York",
+            RAW_TZ_HISTORY="Asia/Tokyo",
+            DISPLAY_TZ="Asia/Tokyo",
+            SESSION_TZ="America/New_York",
+            SESSION_START=(9, 30),
+            SESSION_END=(16, 0),
+        )
 
-    # S-COIN+：日本株 (JST 9:00-15:30)
+    # S-COIN+（日本株）
     if k in ("scoin+", "scoin_plus", "scoinplus", "s-coin+"):
         return dict(
             RAW_TZ_INTRADAY="Asia/Tokyo",
@@ -56,32 +71,33 @@ def market_profile(index_key: str):
             DISPLAY_TZ="Asia/Tokyo",
             SESSION_TZ="Asia/Tokyo",
             SESSION_START=(9, 0),
-            SESSION_END=(15, 30),   # ← ここを 15:30 に
+            SESSION_END=(15, 30),
         )
 
-    # R-BANK9：日本株 (JST 9:00-15:30)
-    if k in ("rbank9", "r-bank9", "r_bank9"):
+    # R-BANK9（日本株）※今回の対象：9:00–15:30 JST
+    if k == "rbank9":
         return dict(
             RAW_TZ_INTRADAY="Asia/Tokyo",
             RAW_TZ_HISTORY="Asia/Tokyo",
             DISPLAY_TZ="Asia/Tokyo",
             SESSION_TZ="Asia/Tokyo",
             SESSION_START=(9, 0),
-            SESSION_END=(15, 30),   # ← ここを 15:30 に
+            SESSION_END=(15, 30),
         )
 
-    # fallback（日本株想定 9:00-15:30）
+    # fallback（JST）
     return dict(
         RAW_TZ_INTRADAY="Asia/Tokyo",
         RAW_TZ_HISTORY="Asia/Tokyo",
         DISPLAY_TZ="Asia/Tokyo",
         SESSION_TZ="Asia/Tokyo",
         SESSION_START=(9, 0),
-        SESSION_END=(15, 30),       # ← ここも 15:30 に
+        SESSION_END=(15, 0),
     )
 
-# ========================== 入出力 ==========================
-
+# ------------------------------------------------------------
+# 入出力ユーティリティ
+# ------------------------------------------------------------
 def _first(paths):
     for p in paths:
         if os.path.exists(p):
@@ -108,134 +124,84 @@ def parse_time_any(x, raw_tz, display_tz):
     if re.fullmatch(r"\d{10}", s):
         return pd.Timestamp(int(s), unit="s", tz="UTC").tz_convert(display_tz)
     # 汎用
-    t = pd.to_datetime(s, errors="coerce")
-    if pd.isna(t):
+    try:
+        t = pd.to_datetime(s, errors="coerce")
+        if pd.isna(t):
+            return pd.NaT
+        if t.tzinfo is None:
+            t = t.tz_localize(raw_tz)
+        return t.tz_convert(display_tz)
+    except Exception:
         return pd.NaT
-    if t.tzinfo is None:
-        t = t.tz_localize(raw_tz)
-    return t.tz_convert(display_tz)
 
-def pick_value_col(df):
-    cols = [c.lower() for c in df.columns]
-    for k in ["close", "price", "value", "index", "終値"]:
-        if k in cols:
-            return df.columns[cols.index(k)]
-    nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    return nums[0] if nums else df.columns[0]
-
-def pick_volume_col(df):
-    cols = [c.lower() for c in df.columns]
-    for k in ["volume", "vol", "出来高"]:
-        if k in cols:
-            return df.columns[cols.index(k)]
-    return None
+# ---- 頑丈版 read_any（コメント・Unnamed列・横持ち＝等加重対応）----
 def read_any(path, raw_tz, display_tz):
     """
-    CSV/TXT を読み、(time, value, volume) に正規化して返す。
-    - 時刻列は 'datetime','time','timestamp','date','unnamed: 0' を優先
-    - 上記が無ければ index を時刻として解釈（to_datetime 可能なら採用）
-    - 値列が特定できない場合、数値列の等加重平均で 'value' を作る
-    - 出来高が無ければ 0 を入れる
+    CSV/TXT から intraday/history を読む。
+    - 先頭が '#' の行はコメントとして無視
+    - 時刻列: 'datetime' 'time' 'timestamp' 'date' or 'unnamed: 0' などを検出
+    - 値列: 代表列が無ければ、数値列の等加重平均
+    - 出来高: 'volume' 'vol' '出来高' があれば使用
     """
-    if not path or not os.path.exists(path):
+    if not path:
         return pd.DataFrame(columns=["time", "value", "volume"])
 
-    # まずは普通に読み込む（index はそのまま）
-    df = pd.read_csv(path)
-
-    # 列名を正規化
+    df = pd.read_csv(
+        path,
+        comment="#",
+        skip_blank_lines=True,
+        engine="python",
+    )
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # --- 時刻列の特定 ---
-    time_candidates_order = ["datetime", "time", "timestamp", "date", "unnamed: 0"]
+    # 時刻列推定
     tcol = None
-    for name in time_candidates_order:
-        if name in df.columns:
-            tcol = name
+    for c in ["datetime", "time", "timestamp", "date"]:
+        if c in df.columns:
+            tcol = c
             break
-
-    # 列に見つからない場合、インデックスを時刻として使う
+    if tcol is None and "unnamed: 0" in df.columns:
+        tcol = "unnamed: 0"
     if tcol is None:
-        # index が RangeIndex 以外なら候補
-        if not isinstance(df.index, pd.RangeIndex):
-            # index を文字列にして to_datetime を試す
-            try:
-                idx_parsed = pd.to_datetime(df.index, errors="coerce")
-                if idx_parsed.notna().any():
-                    df = df.reset_index(names="__idx_time__")
-                    tcol = "__idx_time__"
-                else:
-                    df = df.reset_index(drop=True)
-            except Exception:
-                df = df.reset_index(drop=True)
-        else:
-            # 先頭列が時刻の可能性（保存時に index_col=0 相当）
-            if df.shape[1] > 0:
-                first_col = df.columns[0]
-                try:
-                    probe = pd.to_datetime(df[first_col], errors="coerce")
-                    if probe.notna().any():
-                        tcol = first_col
-                except Exception:
-                    pass
-
+        fuzzy = [c for c in df.columns if ("time" in c) or ("date" in c)]
+        if fuzzy:
+            tcol = fuzzy[0]
     if tcol is None:
-        # ここまで来たら本当に時刻列なし
-        raise KeyError(f"No time-like column found. columns={list(df.columns)}")
+        tcol = df.columns[0]
 
-    # --- 値・出来高列の特定 ---
-    # 明示の値/出来高候補
-    value_name = None
-    for k in ["value", "close", "index", "price", "終値"]:
-        if k in df.columns:
-            value_name = k
-            break
-    volume_name = None
-    for k in ["volume", "vol", "出来高"]:
-        if k in df.columns:
-            volume_name = k
+    # 値列推定
+    vcol = None
+    for c in ["close", "price", "value", "index", "終値"]:
+        if c in df.columns:
+            vcol = c
             break
 
-    # 数値列（時刻列以外）
-    numeric_cols = [c for c in df.columns if c != tcol and pd.api.types.is_numeric_dtype(df[c])]
+    volcol = None
+    for c in ["volume", "vol", "出来高"]:
+        if c in df.columns:
+            volcol = c
+            break
 
-    # 値列が無ければ、数値列の等加重平均で作る（銘柄別列だけのCSV対応）
-    if value_name is None:
-        if len(numeric_cols) == 0:
-            # 一旦、数値に変換できる列を作る努力をする
-            try:
-                tmp_numeric = []
-                for c in [c for c in df.columns if c != tcol]:
-                    s = pd.to_numeric(df[c], errors="coerce")
-                    if s.notna().any():
-                        df[c] = s
-                        tmp_numeric.append(c)
-                numeric_cols = tmp_numeric
-            except Exception:
-                pass
+    out = pd.DataFrame()
+    out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
 
-        if len(numeric_cols) > 0:
-            value_series = df[numeric_cols].mean(axis=1, skipna=True)
+    if vcol is not None:
+        out["value"] = pd.to_numeric(df[vcol], errors="coerce")
+    else:
+        num_cols = [
+            c for c in df.columns
+            if c != tcol and pd.api.types.is_numeric_dtype(df[c])
+        ]
+        if len(num_cols) == 0:
+            out["value"] = np.nan
         else:
-            # 何も無ければ 0 で埋める（描画はスキップされる）
-            value_series = pd.Series([np.nan] * len(df))
+            out["value"] = pd.to_numeric(df[num_cols], errors="coerce").mean(axis=1)
+
+    if volcol is not None:
+        out["volume"] = pd.to_numeric(df[volcol], errors="coerce").fillna(0)
     else:
-        value_series = pd.to_numeric(df[value_name], errors="coerce")
+        out["volume"] = 0
 
-    # 出来高
-    if volume_name:
-        volume_series = pd.to_numeric(df[volume_name], errors="coerce")
-    else:
-        volume_series = pd.Series(0, index=df.index, dtype="float64")
-
-    # --- 時刻の正規化（raw_tz -> display_tz） ---
-    time_series = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
-
-    out = pd.DataFrame({
-        "time": time_series,
-        "value": value_series,
-        "volume": volume_series,
-    })
     out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
     return out
 
@@ -248,41 +214,9 @@ def to_daily(df, display_tz):
     g["time"] = pd.to_datetime(g["date"]).dt.tz_localize(display_tz)
     return g[["time", "value", "volume"]]
 
-# ======================== 正規化（=100） ========================
-
-def compute_base_level(history_df: pd.DataFrame, intraday_df: pd.DataFrame, display_tz: str) -> float:
-    """
-    前日終値を 100 とする基準値を返す。
-    - 履歴があれば「直近営業日の終値」を基準
-    - 無ければ当日の intraday の最初値を基準
-    """
-    # 履歴優先
-    if history_df is not None and not history_df.empty:
-        h = history_df.sort_values("time")
-        # 直近日のさらに前日終値（＝「当日から見た直近確定日」）を優先
-        # もし1行しか無ければその値を基準にする
-        base_series = h["value"].dropna()
-        if not base_series.empty:
-            return float(base_series.iloc[-1])
-
-    # 履歴が無い/空 → intraday の先頭
-    if intraday_df is not None and not intraday_df.empty:
-        first = intraday_df.sort_values("time")["value"].dropna()
-        if not first.empty:
-            return float(first.iloc[0])
-
-    # 最終手段
-    return 1.0
-
-def normalize_to_100(df: pd.DataFrame, base_level: float) -> pd.DataFrame:
-    out = df.copy()
-    if base_level is None or not np.isfinite(base_level) or base_level == 0:
-        base_level = 1.0
-    out["value"] = 100.0 * (out["value"] / float(base_level))
-    return out
-
-# =========================  グラフ補助  =========================
-
+# ------------------------------------------------------------
+# グラフ補助
+# ------------------------------------------------------------
 def format_time_axis(ax, mode, tz):
     if mode == "1d":
         ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=tz))
@@ -301,40 +235,40 @@ def apply_y_padding(ax, series):
     pad = (hi - lo) * 0.08 if hi != lo else max(abs(lo) * 0.02, 0.5)
     ax.set_ylim(lo - pad, hi + pad)
 
-def session_frame_from_base(base_ts_jst, session_tz, display_tz, start_hm, end_hm):
-    # base_ts_jst をセッションタイムゾーンに変換し、その日のセッション枠をJSTに戻す
-    stz = session_tz
-    et = base_ts_jst.tz_convert(stz)
-    d = et.date()
-    start = pd.Timestamp(d.year, d.month, d.day, start_hm[0], start_hm[1], tz=stz)
-    end = pd.Timestamp(d.year, d.month, d.day, end_hm[0], end_hm[1], tz=stz)
-    return start.tz_convert(display_tz), end.tz_convert(display_tz)
+def et_session_to_jst_frame(base_ts_jst, session_tz, display_tz, start_hm, end_hm):
+    et = base_ts_jst.tz_convert(session_tz)
+    et_date = et.date()
+    start_et = pd.Timestamp(et_date.year, et_date.month, et_date.day,
+                            start_hm[0], start_hm[1], tz=session_tz)
+    end_et = pd.Timestamp(et_date.year, et_date.month, et_date.day,
+                          end_hm[0], end_hm[1], tz=session_tz)
+    return start_et.tz_convert(display_tz), end_et.tz_convert(display_tz)
 
-# =========================  描画本体  =========================
-
+# ------------------------------------------------------------
+# 描画（空でも必ず保存）
+# ------------------------------------------------------------
 def plot_df(df, index_key, label, mode, tz, frame=None):
     fig, ax1 = plt.subplots(figsize=(9.5, 4.8))
     ax1.grid(True, alpha=0.3)
 
-    if df.empty:
-        # 軸やタイトルは出す（空PNG対策）
-        ax1.text(0.5, 0.5, "No data", transform=ax1.transAxes,
-                 ha="center", va="center", color="#9aa6c7", fontsize=28, alpha=0.9)
+    if df is None or df.empty:
         ax1.set_title(f"{index_key.upper()} ({label})", color="#ffb6c1")
         ax1.set_xlabel("Time" if mode == "1d" else "Date")
         ax1.set_ylabel("Index Value")
         format_time_axis(ax1, mode, tz)
         if frame is not None:
             ax1.set_xlim(frame)
+        ax1.text(0.5, 0.5, "No data", transform=ax1.transAxes,
+                 ha="center", va="center", color="#b8c2e0", fontsize=24, alpha=0.8)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         outpath = f"{OUTPUT_DIR}/{index_key}_{label}.png"
         plt.tight_layout()
         plt.savefig(outpath, dpi=180)
         plt.close()
-        log(f"saved (empty): {outpath}")
+        print(f"[long_charts] saved (placeholder): {os.path.abspath(outpath)}  exists={os.path.exists(outpath)}")
         return
 
-    # 1d の色
+    # 1d の色分け
     if mode == "1d":
         open_price = df["value"].iloc[0]
         close_price = df["value"].iloc[-1]
@@ -349,12 +283,12 @@ def plot_df(df, index_key, label, mode, tz, frame=None):
         color_line = COLOR_PRICE_DEFAULT
         lw = 1.8
 
-    # 出来高（あれば）
+    # 出来高
     if df["volume"].abs().sum() > 0:
         ax2 = ax1.twinx()
         ax2.bar(df["time"], df["volume"],
                 width=0.9 if mode == "1d" else 0.8,
-                color=COLOR_VOLUME, alpha=0.30, zorder=1, label="Volume")
+                color=COLOR_VOLUME, alpha=0.35, zorder=1, label="Volume")
 
     ax1.plot(df["time"], df["value"], color=color_line, lw=lw,
              solid_capstyle="round", label="Index", zorder=3)
@@ -372,10 +306,11 @@ def plot_df(df, index_key, label, mode, tz, frame=None):
     plt.tight_layout()
     plt.savefig(outpath, dpi=180)
     plt.close()
-    log(f"saved: {outpath}")
+    print(f"[long_charts] saved: {os.path.abspath(outpath)}  exists={os.path.exists(outpath)}")
 
-# ============================ メイン ============================
-
+# ------------------------------------------------------------
+# メイン
+# ------------------------------------------------------------
 def main():
     index_key = os.environ.get("INDEX_KEY", "").lower()
     if not index_key:
@@ -387,40 +322,33 @@ def main():
     intraday_path = find_intraday(OUTPUT_DIR, index_key)
     history_path = find_history(OUTPUT_DIR, index_key)
 
-    intraday_raw = read_any(intraday_path, MP["RAW_TZ_INTRADAY"], MP["DISPLAY_TZ"]) if intraday_path else pd.DataFrame()
-    history_raw = read_any(history_path, MP["RAW_TZ_HISTORY"], MP["DISPLAY_TZ"]) if history_path else pd.DataFrame()
-
-    # 基準値（前日終値 or 当日先頭値）
-    base = compute_base_level(history_raw, intraday_raw, MP["DISPLAY_TZ"])
-    intraday = normalize_to_100(intraday_raw, base) if not intraday_raw.empty else intraday_raw
-    history = normalize_to_100(history_raw, base) if not history_raw.empty else history_raw
-
-    # 日次系列（終値ベース）
+    intraday = read_any(intraday_path, MP["RAW_TZ_INTRADAY"], MP["DISPLAY_TZ"]) if intraday_path else pd.DataFrame()
+    history = read_any(history_path, MP["RAW_TZ_HISTORY"], MP["DISPLAY_TZ"]) if history_path else pd.DataFrame()
     daily_all = to_daily(history if not history.empty else intraday, MP["DISPLAY_TZ"])
 
-    # ---- 1d（セッション切り出し）----
+    # 1d（セッション切り出し）
     if not intraday.empty:
         last_ts = intraday["time"].max()
-        start_jst, end_jst = session_frame_from_base(
-            last_ts, MP["SESSION_TZ"], MP["DISPLAY_TZ"],
-            MP["SESSION_START"], MP["SESSION_END"]
-        )
+        # セッションはプロファイル依存（R-BANK9 は JST 9:00–15:30）
+        start_jst = pd.Timestamp(last_ts.year, last_ts.month, last_ts.day,
+                                 MP["SESSION_START"][0], MP["SESSION_START"][1],
+                                 tz=MP["DISPLAY_TZ"])
+        end_jst   = pd.Timestamp(last_ts.year, last_ts.month, last_ts.day,
+                                 MP["SESSION_END"][0], MP["SESSION_END"][1],
+                                 tz=MP["DISPLAY_TZ"])
         mask = (intraday["time"] >= start_jst) & (intraday["time"] <= end_jst)
         df_1d = intraday.loc[mask].copy()
-        # 1d はギャップ対策でソートと重複除去
-        df_1d = df_1d.sort_values("time").drop_duplicates(subset="time")
         frame_1d = (start_jst, end_jst)
     else:
-        df_1d = pd.DataFrame(columns=["time", "value", "volume"])
+        df_1d = pd.DataFrame()
         frame_1d = None
 
     plot_df(df_1d, index_key, "1d", "1d", MP["DISPLAY_TZ"], frame=frame_1d)
 
-    # ---- 7d / 1m / 1y（終値ベースの長期）----
+    # 7d / 1m / 1y（終値ベース）
     now = pd.Timestamp.now(tz=MP["DISPLAY_TZ"])
     for label, days in [("7d", 7), ("1m", 31), ("1y", 365)]:
-        sub = daily_all[daily_all["time"] >= (now - timedelta(days=days))] if not daily_all.empty else pd.DataFrame()
-        sub = sub.sort_values("time").drop_duplicates(subset="time")
+        sub = daily_all[daily_all["time"] >= (now - timedelta(days=days))]
         plot_df(sub, index_key, label, "long", MP["DISPLAY_TZ"])
 
 if __name__ == "__main__":
