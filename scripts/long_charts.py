@@ -135,23 +135,19 @@ def parse_time_any(x, raw_tz, display_tz):
         return pd.NaT
 
 # ---- 頑丈版 read_any（コメント・Unnamed列・横持ち＝等加重対応）----
+
 def read_any(path, raw_tz, display_tz):
     """
     CSV/TXT から intraday/history を読む。
-    - 先頭が '#' の行はコメントとして無視
-    - 時刻列: 'datetime' 'time' 'timestamp' 'date' or 'unnamed: 0' などを検出
-    - 値列: 代表列が無ければ、数値列の等加重平均
-    - 出来高: 'volume' 'vol' '出来高' があれば使用
+    - 先頭が '#' の行はコメント無視
+    - 時刻列を推定
+    - 値列が無ければ数値列の等加重平均
+    - 出来高はあれば採用
     """
     if not path:
         return pd.DataFrame(columns=["time", "value", "volume"])
 
-    df = pd.read_csv(
-        path,
-        comment="#",
-        skip_blank_lines=True,
-        engine="python",
-    )
+    df = pd.read_csv(path, comment="#", skip_blank_lines=True, engine="python")
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     # 時刻列推定
@@ -169,18 +165,9 @@ def read_any(path, raw_tz, display_tz):
     if tcol is None:
         tcol = df.columns[0]
 
-    # 値列推定
-    vcol = None
-    for c in ["close", "price", "value", "index", "終値"]:
-        if c in df.columns:
-            vcol = c
-            break
-
-    volcol = None
-    for c in ["volume", "vol", "出来高"]:
-        if c in df.columns:
-            volcol = c
-            break
+    # 値/出来高候補
+    vcol = next((c for c in ["close", "price", "value", "index", "終値"] if c in df.columns), None)
+    volcol = next((c for c in ["volume", "vol", "出来高"] if c in df.columns), None)
 
     out = pd.DataFrame()
     out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
@@ -188,22 +175,20 @@ def read_any(path, raw_tz, display_tz):
     if vcol is not None:
         out["value"] = pd.to_numeric(df[vcol], errors="coerce")
     else:
-        num_cols = [
-            c for c in df.columns
-            if c != tcol and pd.api.types.is_numeric_dtype(df[c])
-        ]
+        # 代表列が無い → 数値列の等加重平均
+        num_cols = [c for c in df.columns if c != tcol]
         if len(num_cols) == 0:
             out["value"] = np.nan
         else:
-            out["value"] = pd.to_numeric(df[num_cols], errors="coerce").mean(axis=1)
+            # 各列ごとに to_numeric（DataFrame まとめては不可）
+            vals = df[num_cols].apply(lambda s: pd.to_numeric(s, errors="coerce"))
+            # すべて NaN になった列は無視（全部NaNだと mean が NaN のままなのでOK）
+            out["value"] = vals.mean(axis=1)
 
-    if volcol is not None:
-        out["volume"] = pd.to_numeric(df[volcol], errors="coerce").fillna(0)
-    else:
-        out["volume"] = 0
-
+    out["volume"] = pd.to_numeric(df[volcol], errors="coerce").fillna(0) if volcol else 0
     out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
     return out
+
 
 def to_daily(df, display_tz):
     if df.empty:
