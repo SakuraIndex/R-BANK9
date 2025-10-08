@@ -1,41 +1,31 @@
-name: Generate long-term charts (price + volume + SMA)
+name: Generate long-term charts (R-BANK9)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '40 6 * * *'  # JST 15:40
-
-permissions:
-  contents: write
+    - cron: "30 6 * * *"  # JST 15:30頃（東証引け後の再集計に合わせるなら16:10なども可）
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      INDEX_KEY: astra4  # 各リポで変更（astra4 / scoin_plus / rbank9 / ain10）
+      INDEX_KEY: rbank9
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+          python-version: "3.11"
+      - name: Install deps
         run: |
-          pip install pandas matplotlib
-
-      - name: Generate charts (7d/1m/1y)
-        run: python scripts/long_charts.py
-
+          python -m pip install --upgrade pip
+          pip install pandas pytz matplotlib numpy
+      - name: Generate long-term charts
+        run: |
+          python scripts/long_charts.py
       - name: Commit charts if changed
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(charts): update long-term charts with SMA & volume"
-          file_pattern: |
-            docs/outputs/*_7d.png
-            docs/outputs/*_1m.png
-            docs/outputs/*_1y.png
-            docs/outputs/*_7d.csv
-            docs/outputs/*_1m.csv
-            docs/outputs/*_1y.csv
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/* || true
+          git commit -m "chore(charts): update R-BANK9 long-term charts" || echo "no changes"
+          git push || true
