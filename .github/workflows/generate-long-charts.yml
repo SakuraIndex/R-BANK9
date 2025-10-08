@@ -9,6 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,25 +27,62 @@ jobs:
 
       - name: List BEFORE
         run: |
-          pwd
+          echo "CWD=$(pwd)"
           ls -lah
+          mkdir -p docs/outputs
           ls -lah docs/outputs || true
+
+      # （任意だけど推奨）
+      # 履歴が空だと 7d/1m/1y が描けないので、履歴を作る/更新するスクリプトがあるなら先に実行
+      # - name: Build/append daily history from intraday
+      #   run: python scripts/update_history.py
+      #   env:
+      #     INDEX_KEY: rbank9
 
       - name: Generate long-term charts
         env:
-          INDEX_KEY: rbank9   # ← 小文字＆アンダースコア無しで統一
-        run: python scripts/long_charts.py
+          INDEX_KEY: rbank9
+        run: |
+          python scripts/long_charts.py
+          echo "---- AFTER DRAW ----"
+          ls -lah docs/outputs || true
+
+          # 生成確認（1d は必須、他は任意）
+          test -f docs/outputs/rbank9_1d.png || (echo "rbank9_1d.png not created" && exit 1)
+
+      # 生成物をアーティファクトでも保存（Git push 前に中身を目視できる）
+      - name: Upload charts artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbank9-charts
+          path: docs/outputs/*.png
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: List AFTER
         run: |
           echo "CWD=$(pwd)"
-          ls -lah docs/outputs
+          ls -lah docs/outputs || true
           git status --porcelain
 
       - name: Commit charts if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 念のため
+          git config --global safe.directory "$(pwd)"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/*.png || true
-          git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)" || echo "no changes"
-          git push || true
+
+          # 変更取り込み（他のジョブ/手動pushが直前にあっても安全に）
+          git pull --rebase || true
+
+          # PNG をステージング → 変更があれば commit/push
+          git add docs/outputs/*.png 2>/dev/null || true
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)"
+            git push
+          else
+            echo "No chart changes to commit."
+          fi
