@@ -19,7 +19,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: pip install -r requirements.txt
@@ -30,22 +30,17 @@ jobs:
           ls -lah
           ls -lah docs/outputs || true
 
-      # ← ここに INDEX_KEY を渡す！
+      # 1) 当日 intraday から履歴(date,value)に追記
       - name: Append daily history from intraday
         env:
           INDEX_KEY: rbank9
         run: python scripts/update_history.py
 
-      # ← こちらにも INDEX_KEY を渡す！
+      # 2) 履歴を使って 7d/1m/1y、intraday で 1d を生成
       - name: Generate long-term charts
         env:
           INDEX_KEY: rbank9
         run: python scripts/long_charts.py
-
-      - name: Touch last-run marker
-        run: |
-          mkdir -p docs/outputs
-          date +'%Y-%m-%d %H:%M:%S%z' > docs/outputs/_last_run.txt
 
       - name: List AFTER
         run: |
@@ -57,8 +52,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/*.png || true
-          git add docs/outputs/*history.csv || true
-          git add docs/outputs/_last_run.txt || true
+          git add docs/outputs/*.png docs/outputs/*history.csv docs/outputs/_last_run.txt || true
           git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)" || echo "no changes"
           git push || true
