@@ -182,39 +182,31 @@ def pick_time_col(cols_lower: List[str]) -> Optional[str]:
     fuzzy = [i for i, c in enumerate(cols_lower) if ("time" in c) or ("date" in c)]
     return cols_lower[fuzzy[0]] if fuzzy else None
 
-def read_any(path: Optional[str], raw_tz: str, display_tz: str) -> pd.DataFrame:
-    """
-    列名を正規化し、下記の2系統をどちらも受け付ける:
-      1) 既に「time/value/volume」列がある系列形式
-      2) 1行=時刻、数値列=各銘柄 の板状CSV（等加重平均で value を作る）
-    """
-    if not path:
+    # 盤面形式: 時刻列以外の「数値列」を平均
+    num_cols = []
+    for c in df.columns:
+        if c == tcol:
+            continue
+        # 文字列混在でも数値化できれば対象（coerce）
+        as_num = pd.to_numeric(df[c], errors="coerce")
+        if as_num.notna().sum() > 0:
+            num_cols.append(c)
+
+    if len(num_cols) == 0:
+        # すべて非数値なら空
         return pd.DataFrame(columns=["time", "value", "volume"])
 
-    df = pd.read_csv(path)
+    out = pd.DataFrame()
+    out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
+    out["time"] = ensure_tz(out["time"], display_tz)
 
-    # 列名正規化
-    raw_cols = list(df.columns)
-    cols_lower = [str(c).strip().lower() for c in raw_cols]
-    df.columns = cols_lower
+    # 🔽 ここを修正（2行まとめて置き換え）
+    vals_df = df[num_cols].apply(lambda s: pd.to_numeric(s, errors="coerce"))
+    out["value"] = vals_df.mean(axis=1)
 
-    # 時刻列探索
-    tcol = pick_time_col(cols_lower)
-    if tcol is None:
-        raise KeyError(f"No time-like column found. columns={list(df.columns)}")
-
-    # 既存の代表列があるか？
-    if "value" in cols_lower or "close" in cols_lower or "index" in cols_lower:
-        vcol = "value" if "value" in cols_lower else ("close" if "close" in cols_lower else "index")
-        volcol = "volume" if "volume" in cols_lower else None
-
-        out = pd.DataFrame()
-        out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
-        out["time"] = ensure_tz(out["time"], display_tz)
-        out["value"] = pd.to_numeric(df[vcol], errors="coerce")
-        out["volume"] = pd.to_numeric(df[volcol], errors="coerce") if volcol else 0
-        out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
-        return out
+    out["volume"] = 0  # 盤面からは出来高なし
+    out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
+    return out
 
     # 盤面形式: 時刻列以外の「数値列」を平均
     num_cols = []
