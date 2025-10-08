@@ -18,6 +18,16 @@ from __future__ import annotations
 
 import os
 import re
+# ============================================================
+# 出力ディレクトリを絶対パスで指定（これでズレを防止）
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "..", "docs", "outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"[INFO] Charts will be saved to: {os.path.abspath(OUTPUT_DIR)}")
+
 from typing import Optional, Tuple, List
 from datetime import timedelta
 
