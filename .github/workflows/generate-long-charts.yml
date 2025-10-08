@@ -1,6 +1,8 @@
 name: Generate long-term charts (R-BANK9)
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: write
 
@@ -22,22 +24,44 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: List BEFORE
+        run: |
+          pwd
+          ls -lah
+          ls -lah docs/outputs || true
+
       - name: Generate long-term charts
         env:
           INDEX_KEY: rbank9
-        run: |
-          mkdir -p docs/outputs
-          python scripts/long_charts.py
-          echo "---- AFTER DRAW ----"
-          ls -lah docs/outputs || true
+        run: python scripts/long_charts.py
 
-      - name: Force commit and push charts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: List AFTER
         run: |
-          git config --global user.name  "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "CWD=$(pwd)"
+          ls -lah docs/outputs || true
+          echo "--- full path ---"
+          realpath docs/outputs || true
+          echo "--- png timestamps ---"
+          ls -lah --full-time docs/outputs/*.png 2>/dev/null || true
+          echo "--- png sha256 ---"
+          (cd docs/outputs && sha256sum *.png) 2>/dev/null || true
+          echo "--- stamp ---"
+          cat docs/outputs/_last_run.txt 2>/dev/null || echo "(no stamp)"
+          echo "--- git status ---"
+          git status --porcelain -uall
+
+      - name: Commit charts if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase || true
-          git add -f docs/outputs/*.png || true
-          git commit -am "force update: long-term charts (R-BANK9)" || echo "no commit"
-          git push --force
+          git add -A docs/outputs
+          echo "--- pending changes ---"
+          git status --porcelain -uall
+          if [ -n "$(git status --porcelain -uall)" ]; then
+            git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)"
+            git push
+            echo "✅ pushed chart updates"
+          else
+            echo "ℹ️ no changes to commit"
+          fi
