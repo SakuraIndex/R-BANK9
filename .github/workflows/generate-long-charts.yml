@@ -30,38 +30,32 @@ jobs:
           ls -lah
           ls -lah docs/outputs || true
 
+      # ① intraday -> history（日次終値へマージ）
+      - name: Append daily history from intraday
+        run: python scripts/update_history.py
+
+      # ② チャートを生成（1d/7d/1m/1y）
       - name: Generate long-term charts
         env:
           INDEX_KEY: rbank9
         run: python scripts/long_charts.py
 
+      # ③ “必ず差分が出る” テキストを更新（コミット抑止回避）
+      - name: Touch last-run marker
+        run: |
+          mkdir -p docs/outputs
+          date +'%Y-%m-%d %H:%M:%S%z' > docs/outputs/_last_run.txt
+
       - name: List AFTER
         run: |
           echo "CWD=$(pwd)"
-          ls -lah docs/outputs || true
-          echo "--- full path ---"
-          realpath docs/outputs || true
-          echo "--- png timestamps ---"
-          ls -lah --full-time docs/outputs/*.png 2>/dev/null || true
-          echo "--- png sha256 ---"
-          (cd docs/outputs && sha256sum *.png) 2>/dev/null || true
-          echo "--- stamp ---"
-          cat docs/outputs/_last_run.txt 2>/dev/null || echo "(no stamp)"
-          echo "--- git status ---"
-          git status --porcelain -uall
+          ls -lah docs/outputs
+          git status --porcelain
 
       - name: Commit charts if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase || true
-          git add -A docs/outputs
-          echo "--- pending changes ---"
-          git status --porcelain -uall
-          if [ -n "$(git status --porcelain -uall)" ]; then
-            git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)"
-            git push
-            echo "✅ pushed chart updates"
-          else
-            echo "ℹ️ no changes to commit"
-          fi
+          git add docs/outputs/*.png docs/outputs/*history*.csv docs/outputs/_last_run.txt || true
+          git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)" || echo "no changes"
+          git push || true
