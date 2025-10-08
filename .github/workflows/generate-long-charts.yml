@@ -28,16 +28,9 @@ jobs:
       - name: List BEFORE
         run: |
           echo "CWD=$(pwd)"
-          ls -lah
           mkdir -p docs/outputs
+          ls -lah
           ls -lah docs/outputs || true
-
-      # （任意だけど推奨）
-      # 履歴が空だと 7d/1m/1y が描けないので、履歴を作る/更新するスクリプトがあるなら先に実行
-      # - name: Build/append daily history from intraday
-      #   run: python scripts/update_history.py
-      #   env:
-      #     INDEX_KEY: rbank9
 
       - name: Generate long-term charts
         env:
@@ -46,43 +39,48 @@ jobs:
           python scripts/long_charts.py
           echo "---- AFTER DRAW ----"
           ls -lah docs/outputs || true
-
-          # 生成確認（1d は必須、他は任意）
+          # 生成必須チェック（1d）
           test -f docs/outputs/rbank9_1d.png || (echo "rbank9_1d.png not created" && exit 1)
+          # 指名漏れ/命名ミス検知用に一覧出力
+          echo "PNG list:"
+          find docs/outputs -maxdepth 1 -type f -name "*.png" -printf "%P\n" || true
 
-      # 生成物をアーティファクトでも保存（Git push 前に中身を目視できる）
       - name: Upload charts artifact
         uses: actions/upload-artifact@v4
         with:
           name: rbank9-charts
           path: docs/outputs/*.png
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
       - name: List AFTER
         run: |
-          echo "CWD=$(pwd)"
           ls -lah docs/outputs || true
           git status --porcelain
 
-      - name: Commit charts if changed
+      - name: Commit charts if changed (force add to bypass .gitignore)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 念のため
+          set -e
           git config --global safe.directory "$(pwd)"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 変更取り込み（他のジョブ/手動pushが直前にあっても安全に）
+          # 直前の更新を安全に取り込み
           git pull --rebase || true
 
-          # PNG をステージング → 変更があれば commit/push
-          git add docs/outputs/*.png 2>/dev/null || true
+          # .gitignore で弾かれても add できるように -f
+          git add -f docs/outputs/*.png 2>/dev/null || true
 
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)"
-            git push
-          else
-            echo "No chart changes to commit."
+          # ステージングされているか確認
+          if git diff --cached --quiet; then
+            echo "No staged PNG changes (likely identical content or not generated)."
+            echo "Listing files for debugging:"
+            git ls-files -v docs/outputs | cat
+            exit 0
           fi
+
+          git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)"
+          git push
+
