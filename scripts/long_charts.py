@@ -129,35 +129,113 @@ def pick_volume_col(df):
         if k in cols:
             return df.columns[cols.index(k)]
     return None
-
 def read_any(path, raw_tz, display_tz):
-    """列名を正規化してから時刻/値/出来高を抽出。"""
-    if not path:
+    """
+    CSV/TXT を読み、(time, value, volume) に正規化して返す。
+    - 時刻列は 'datetime','time','timestamp','date','unnamed: 0' を優先
+    - 上記が無ければ index を時刻として解釈（to_datetime 可能なら採用）
+    - 値列が特定できない場合、数値列の等加重平均で 'value' を作る
+    - 出来高が無ければ 0 を入れる
+    """
+    if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["time", "value", "volume"])
 
+    # まずは普通に読み込む（index はそのまま）
     df = pd.read_csv(path)
+
+    # 列名を正規化
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # 時刻候補
+    # --- 時刻列の特定 ---
+    time_candidates_order = ["datetime", "time", "timestamp", "date", "unnamed: 0"]
     tcol = None
-    for name in ["datetime", "time", "timestamp", "date"]:
+    for name in time_candidates_order:
         if name in df.columns:
             tcol = name
             break
+
+    # 列に見つからない場合、インデックスを時刻として使う
     if tcol is None:
-        fuzzy = [c for c in df.columns if ("time" in c) or ("date" in c)]
-        if fuzzy:
-            tcol = fuzzy[0]
+        # index が RangeIndex 以外なら候補
+        if not isinstance(df.index, pd.RangeIndex):
+            # index を文字列にして to_datetime を試す
+            try:
+                idx_parsed = pd.to_datetime(df.index, errors="coerce")
+                if idx_parsed.notna().any():
+                    df = df.reset_index(names="__idx_time__")
+                    tcol = "__idx_time__"
+                else:
+                    df = df.reset_index(drop=True)
+            except Exception:
+                df = df.reset_index(drop=True)
+        else:
+            # 先頭列が時刻の可能性（保存時に index_col=0 相当）
+            if df.shape[1] > 0:
+                first_col = df.columns[0]
+                try:
+                    probe = pd.to_datetime(df[first_col], errors="coerce")
+                    if probe.notna().any():
+                        tcol = first_col
+                except Exception:
+                    pass
+
     if tcol is None:
+        # ここまで来たら本当に時刻列なし
         raise KeyError(f"No time-like column found. columns={list(df.columns)}")
 
-    vcol = pick_value_col(df)
-    volcol = pick_volume_col(df)
+    # --- 値・出来高列の特定 ---
+    # 明示の値/出来高候補
+    value_name = None
+    for k in ["value", "close", "index", "price", "終値"]:
+        if k in df.columns:
+            value_name = k
+            break
+    volume_name = None
+    for k in ["volume", "vol", "出来高"]:
+        if k in df.columns:
+            volume_name = k
+            break
 
-    out = pd.DataFrame()
-    out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
-    out["value"] = pd.to_numeric(df[vcol], errors="coerce")
-    out["volume"] = pd.to_numeric(df[volcol], errors="coerce") if volcol else 0
+    # 数値列（時刻列以外）
+    numeric_cols = [c for c in df.columns if c != tcol and pd.api.types.is_numeric_dtype(df[c])]
+
+    # 値列が無ければ、数値列の等加重平均で作る（銘柄別列だけのCSV対応）
+    if value_name is None:
+        if len(numeric_cols) == 0:
+            # 一旦、数値に変換できる列を作る努力をする
+            try:
+                tmp_numeric = []
+                for c in [c for c in df.columns if c != tcol]:
+                    s = pd.to_numeric(df[c], errors="coerce")
+                    if s.notna().any():
+                        df[c] = s
+                        tmp_numeric.append(c)
+                numeric_cols = tmp_numeric
+            except Exception:
+                pass
+
+        if len(numeric_cols) > 0:
+            value_series = df[numeric_cols].mean(axis=1, skipna=True)
+        else:
+            # 何も無ければ 0 で埋める（描画はスキップされる）
+            value_series = pd.Series([np.nan] * len(df))
+    else:
+        value_series = pd.to_numeric(df[value_name], errors="coerce")
+
+    # 出来高
+    if volume_name:
+        volume_series = pd.to_numeric(df[volume_name], errors="coerce")
+    else:
+        volume_series = pd.Series(0, index=df.index, dtype="float64")
+
+    # --- 時刻の正規化（raw_tz -> display_tz） ---
+    time_series = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
+
+    out = pd.DataFrame({
+        "time": time_series,
+        "value": value_series,
+        "volume": volume_series,
+    })
     out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
     return out
 
