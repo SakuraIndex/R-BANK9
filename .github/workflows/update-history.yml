@@ -1,50 +1,88 @@
 name: Update history & long-term charts
 
 on:
-  schedule:
-    # JST 15:40 (UTC は -9h → 06:40)
-    - cron: '40 06 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Index key (e.g., rbank9)"
+        required: false
+        default: "rbank9"
 
 permissions:
   contents: write
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        index: [rbank9, scoin_plus, astra4, ain10]  # 必要なものだけに減らしてOK
+
+    env:
+      INDEX_KEY: ${{ github.event.inputs.index || 'rbank9' }}
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Show repo tree (top)
+        run: |
+          pwd
+          ls -la
+          echo "---- scripts ----"
+          ls -la scripts || true
+          echo "---- docs/outputs ----"
+          ls -la docs/outputs || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          pip install pandas pytz matplotlib
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      - name: Append today's history
-        env:
-          INDEX_KEY: ${{ matrix.index }}
+      # 1) 当日終値を history.csv に追記
+      - name: Append today to history
         run: |
           python scripts/update_history.py
-
-      - name: Generate long-term charts (1d/7d/1m/1y)
         env:
-          INDEX_KEY: ${{ matrix.index }}
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+
+      # 2) 長期チャートを作成（1d/7d/1m/1y）
+      - name: Generate long-term charts
         run: |
           python scripts/long_charts.py
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
 
+      # 3) 生成物の確認
+      - name: List outputs
+        run: |
+          echo "INDEX_KEY=$INDEX_KEY"
+          ls -la docs/outputs || true
+          echo "----- preview head of history.csv -----"
+          if [ -f docs/outputs/${INDEX_KEY}_history.csv ]; then
+            head -n 5 docs/outputs/${INDEX_KEY}_history.csv
+            tail -n 5 docs/outputs/${INDEX_KEY}_history.csv
+          else
+            echo "history.csv not found"
+          fi
+
+      # 4) 変更があればコミット
       - name: Commit changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(charts): update history & long-term charts (${{ matrix.index }})"
-          file_pattern: |
-            docs/outputs/${{ matrix.index }}_history.csv
-            docs/outputs/${{ matrix.index }}_*.png
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(history/charts): update ${INDEX_KEY} long-term charts"
+            git push
+          fi
