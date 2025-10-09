@@ -1,0 +1,78 @@
+name: Daily R-BANK9 refresh
+
+on:
+  # 手動実行も可能
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Index key (e.g., rbank9)"
+        required: false
+        default: "rbank9"
+
+  # 平日 15:40 JST に自動実行（GitHubはUTC運用なので 06:40 に設定）
+  schedule:
+    - cron: "40 06 * * 1-5"
+
+permissions:
+  contents: write   # 自動コミットに必要
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      # 手動実行時は inputs.index を、スケジュール実行時は rbank9 を使う
+      INDEX_KEY: ${{ github.event.inputs.index != '' && github.event.inputs.index || 'rbank9' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 1) 当日分の分足を生成（/docs/outputs/<index>_intraday.csv など）
+      - name: Run intraday fetch
+        run: |
+          python src/rbank9_intraday.py
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+
+      # 2) 前日終値や当日終値などから /docs/outputs/<index>_history.csv に1行追記
+      - name: Update history CSV
+        run: |
+          python scripts/update_history.py
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+
+      # 3) 1d / 7d / 1m / 1y の PNG を生成（/docs/outputs/ に4枚）
+      - name: Generate long-term charts
+        run: |
+          python scripts/long_charts.py
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+
+      # 4) 変更物をコミット＆プッシュ
+      - name: Commit charts & history
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(history/charts): update ${{ env.INDEX_KEY }} long-term charts"
+          file_pattern: |
+            docs/outputs/*
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          push_options: --force-with-lease
