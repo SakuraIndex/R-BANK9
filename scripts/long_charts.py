@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Generate long-term charts for an index (1d / 7d / 1m / 1y) and
-append today's close to history automatically.
+Generate long-term charts (1d / 7d / 1m / 1y)
+
+- 1d  : intraday CSV を読み、直近セッション(JST) 09:00–15:30だけを描画
+- 7d/1m/1y: history CSV (date,value) を描画
+- 互換のため 1d を <index>_intraday.png としても保存
 
 出力:
   docs/outputs/<index>_1d.png
   docs/outputs/<index>_7d.png
   docs/outputs/<index>_1m.png
   docs/outputs/<index>_1y.png
-  docs/outputs/_last_run.txt
-
-環境変数:
-  INDEX_KEY  … デフォルト "rbank9"（rbank9 / scoin_plus / ain10 / astra4 等）
+  docs/outputs/<index>_intraday.png  (1dと同じ)
 """
 
 from __future__ import annotations
-
 import os
+import shutil
 from typing import Optional, List
 
 import pandas as pd
 import numpy as np
+import pytz
 import matplotlib
 import matplotlib.pyplot as plt
 
@@ -33,8 +34,8 @@ SESSION_END   = "15:30"
 # ダークテーマ色
 BG = "#0E1117"
 FG = "#E6E6E6"
-ACCENT = "#3bd6c6"   # ティール系ライン
-TITLE  = "#f2b6c6"   # ピンク系タイトル
+ACCENT = "#3bd6c6"
+TITLE  = "#f2b6c6"
 GRID_A = 0.25
 
 # ====== Matplotlib 全体設定 ======
@@ -50,63 +51,46 @@ matplotlib.rcParams.update({
     "savefig.facecolor": BG,
 })
 
-
 # ====== ユーティリティ ======
 def _lower_cols(df: pd.DataFrame) -> List[str]:
-    raw = list(df.columns)
-    cols_lower = [str(c).strip().lower() for c in raw]
+    cols_lower = [str(c).strip().lower() for c in df.columns]
     df.columns = cols_lower
     return cols_lower
-
 
 def _pick_time_col(cols_lower: List[str]) -> Optional[str]:
     for k in ("time", "timestamp", "date", "datetime"):
         if k in cols_lower:
             return k
-    # Unnamed: 0 を time 扱い
     for c in cols_lower:
-        if c.startswith("unnamed") and ": 0" in c:
+        if c.startswith("unnamed") and (": 0" in c or c.endswith("0")):
             return c
-    # あいまい一致
     for c in cols_lower:
         if ("time" in c) or ("date" in c):
             return c
     return None
 
-
-def _ensure_tz(series: pd.Series, tz: str) -> pd.Series:
-    """Series(datetime64) を tz-aware にして指定TZへ."""
-    if not isinstance(series, pd.Series):
-        return series
-    try:
-        # まず UTC として解釈
-        dt = pd.to_datetime(series, utc=True, errors="coerce")
-    except Exception:
-        dt = pd.to_datetime(series, errors="coerce")
-    # 表示TZへ
-    return dt.dt.tz_convert(tz)
-
-
 def parse_time_any(x, raw_tz: str, display_tz: str):
-    """生時刻文字列をできるだけ頑健にTZ付きへ。"""
-    ts = pd.to_datetime(x, utc=True, errors="coerce")
+    """
+    文字列/数値/epochを受け、naiveは raw_tz とみなしてローカライズ→display_tzに変換。
+    """
+    ts = pd.to_datetime(x, errors="coerce")  # utc=True は使わない
     if pd.isna(ts):
         return pd.NaT
-    # tz-aware（UTC）→ display_tz
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(raw_tz)
     return ts.tz_convert(display_tz)
-
 
 def read_any_intraday(path: Optional[str], raw_tz: str, display_tz: str) -> pd.DataFrame:
     """
-    intraday CSV を読み込み、必ず ["time","value","volume"] を返す。
-    - time/value/volume 形式 or 銘柄横並び形式（等加重平均）
+    intraday CSV を読み、「time」「value」「volume」を返す。
+    - time/value/volume 形式 or 銘柄横並び形式（等加重平均）を自動解釈
     - 先頭 "Unnamed: 0" も time として扱う
-    - コメント列（先頭が "#"）は無視
     """
     if not path or not os.path.exists(path):
         return pd.DataFrame(columns=["time", "value", "volume"])
 
     df = pd.read_csv(path, dtype=str)
+    # コメント列（先頭が #）は除去
     drop_cols = [c for c in df.columns if str(c).strip().startswith("#")]
     if drop_cols:
         df = df.drop(columns=drop_cols)
@@ -116,25 +100,24 @@ def read_any_intraday(path: Optional[str], raw_tz: str, display_tz: str) -> pd.D
     if tcol is None:
         raise KeyError(f"No time-like column found. columns={list(df.columns)}")
 
-    # 単一 value/volume か判定
+    # value/volume がある場合
     vcol = None
     volcol = None
     for c in df.columns:
-        lc = c.lower()
-        if lc in ("value", "index", "score") or ("value" in lc):
+        lc = str(c).lower()
+        if lc in ("value", "index") or ("value" in lc) or ("close" in lc):
             vcol = c
         if lc == "volume" or ("volume" in lc):
             volcol = c
 
     out = pd.DataFrame()
     out["time"] = df[tcol].apply(lambda x: parse_time_any(x, raw_tz, display_tz))
-    out["time"] = _ensure_tz(out["time"], display_tz)
 
     if vcol is not None:
         out["value"] = pd.to_numeric(df[vcol], errors="coerce")
         out["volume"] = pd.to_numeric(df[volcol], errors="coerce") if (volcol and volcol in df.columns) else 0
     else:
-        # 板形式：time 以外を数値化 → 等加重平均
+        # 銘柄横並び: time 以外を数値化 → 等加重平均
         num_cols: List[str] = []
         for c in df.columns:
             if c == tcol:
@@ -151,21 +134,25 @@ def read_any_intraday(path: Optional[str], raw_tz: str, display_tz: str) -> pd.D
     out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
     return out
 
-
-def clamp_to_session_today_jst(df: pd.DataFrame) -> pd.DataFrame:
-    """当日(JST)の 09:00–15:30 に限定。"""
+def clamp_to_latest_session_jst(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    データ中の「最後のタイムスタンプの“日付(JST)”」をその日のセッションとして抽出。
+    当日データが無い日・休日でも、直近営業日のセッションが出せる。
+    """
     if df.empty:
         return df
-    t = df["time"].dt.tz_convert(JP_TZ)
-    today = pd.Timestamp.now(tz=JP_TZ).normalize()
-    start = pd.to_datetime(f"{today.date()} {SESSION_START}", utc=False).tz_localize(JP_TZ)
-    end   = pd.to_datetime(f"{today.date()} {SESSION_END}"  , utc=False).tz_localize(JP_TZ)
-    m = (t >= start) & (t <= end)
-    return df.loc[m].reset_index(drop=True)
-
+    t_jst = df["time"].dt.tz_convert(JP_TZ)
+    last_day = t_jst.max().date()
+    start = pd.Timestamp(f"{last_day} {SESSION_START}", tz=JP_TZ)
+    end   = pd.Timestamp(f"{last_day} {SESSION_END}",   tz=JP_TZ)
+    m = (t_jst >= start) & (t_jst <= end)
+    sliced = df.loc[m].reset_index(drop=True)
+    if sliced.empty:
+        # 念のため、同日のデータだけ確保（時間帯外でもプロットはできる）
+        sliced = df.loc[t_jst.dt.date == last_day].reset_index(drop=True)
+    return sliced
 
 def resample_to_minutes(df: pd.DataFrame, rule: str = "1min") -> pd.DataFrame:
-    """time を index にして線形補間の簡易リサンプル。"""
     if df.empty:
         return df
     tmp = df.set_index("time").sort_index()
@@ -174,7 +161,6 @@ def resample_to_minutes(df: pd.DataFrame, rule: str = "1min") -> pd.DataFrame:
     out["volume"] = 0
     out = out.reset_index()
     return out
-
 
 # ====== 描画ヘルパ ======
 def _decorate_axes(ax, title: str, x_label: str, y_label: str):
@@ -185,11 +171,9 @@ def _decorate_axes(ax, title: str, x_label: str, y_label: str):
     for sp in ax.spines.values():
         sp.set_color(FG)
 
-
 def save_png(fig: plt.Figure, out_path: str):
-    fig.savefig(out_path, facecolor=BG, bbox_inches="tight")
+    fig.savefig(out_path, facecolor=BG, bbox_inches="tight", dpi=150)
     plt.close(fig)
-
 
 # ====== 長期用（履歴） ======
 def read_history(path: str) -> pd.DataFrame:
@@ -199,11 +183,10 @@ def read_history(path: str) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
     if "date" not in df.columns or "value" not in df.columns:
         return pd.DataFrame(columns=["date", "value"])
-    df["date"] = pd.to_datetime(df["date"], utc=False, errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
     return df
-
 
 def plot_history_panel(ax, hist: pd.DataFrame, title: str):
     _decorate_axes(ax, title, "Date", "Index Value")
@@ -212,48 +195,13 @@ def plot_history_panel(ax, hist: pd.DataFrame, title: str):
         ax.plot(hist["date"], hist["value"], linewidth=2.2, color=ACCENT)
     elif len(hist) == 1:
         ax.plot(hist["date"], hist["value"], marker="o", markersize=6, linewidth=0, color=ACCENT)
-        y = hist["value"].iloc[0]
+        y = float(hist["value"].iloc[0])
         ax.set_ylim(y - 0.1, y + 0.1)
         ax.text(0.5, 0.5, "Only 1 point (need ≥ 2)", transform=ax.transAxes,
                 ha="center", va="center", alpha=0.5)
     else:
         ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
                 ha="center", va="center", alpha=0.5)
-
-
-# ====== 追加: 当日クローズを history に追記 ======
-def append_today_close_to_history(history_csv: str, intraday_csv: str):
-    """
-    intraday（当日1分足化）から “15:30 JST の終値” を history に追記。
-    - すでに当日が入っていれば何もしない（重複防止）
-    - intraday が空なら何もしない（休日/まだ相場中など）
-    """
-    hist = pd.DataFrame(columns=["date", "value"])
-    if os.path.exists(history_csv):
-        hist = read_history(history_csv)
-
-    today_jst = pd.Timestamp.now(tz=JP_TZ).normalize().date()
-    if not hist.empty and today_jst in set(hist["date"].dt.date):
-        return  # 既に書き込み済み
-
-    try:
-        intraday = read_any_intraday(intraday_csv, JP_TZ, JP_TZ)
-        intraday = clamp_to_session_today_jst(intraday)
-        if intraday.empty:
-            return
-        intraday = resample_to_minutes(intraday, "1min")
-        close_val = float(intraday["value"].iloc[-1])
-    except Exception:
-        return
-
-    new = pd.DataFrame({"date": [pd.Timestamp(today_jst)], "value": [close_val]})
-    out = new if hist.empty else (
-        pd.concat([hist[["date", "value"]], new], ignore_index=True)
-          .sort_values("date")
-          .reset_index(drop=True)
-    )
-    out.to_csv(history_csv, index=False)
-
 
 # ====== メイン ======
 def main():
@@ -266,14 +214,15 @@ def main():
     intraday_csv = os.path.join(outputs_dir, f"{index_key}_intraday.csv")
     history_csv  = os.path.join(outputs_dir, f"{index_key}_history.csv")
 
-    # 1) 当日終値を history に追記（重複チェック込み）
-    append_today_close_to_history(history_csv, intraday_csv)
-
     # ---------- 1d ----------
     try:
         intraday = read_any_intraday(intraday_csv, JP_TZ, JP_TZ)
-        intraday = clamp_to_session_today_jst(intraday)
+        print(f"[INFO] intraday rows: {len(intraday)} "
+              f"min={intraday['time'].min() if not intraday.empty else None} "
+              f"max={intraday['time'].max() if not intraday.empty else None}")
+        intraday = clamp_to_latest_session_jst(intraday)
         intraday = resample_to_minutes(intraday, "1min")
+        print(f"[INFO] intraday after clamp/resample rows: {len(intraday)}")
     except Exception as e:
         print(f"[WARN] intraday load failed: {e}")
         intraday = pd.DataFrame(columns=["time", "value", "volume"])
@@ -285,30 +234,38 @@ def main():
     else:
         ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
                 ha="center", va="center", alpha=0.6)
-    save_png(fig, os.path.join(outputs_dir, f"{index_key}_1d.png"))
+    out_1d = os.path.join(outputs_dir, f"{index_key}_1d.png")
+    save_png(fig, out_1d)
+
+    # 互換：intraday.png も出す
+    try:
+        shutil.copyfile(out_1d, os.path.join(outputs_dir, f"{index_key}_intraday.png"))
+    except Exception as e:
+        print(f"[WARN] copy intraday.png failed: {e}")
 
     # ---------- 7d / 1m / 1y ----------
     history = read_history(history_csv)
+    print(f"[INFO] history rows: {len(history)} "
+          f"min={history['date'].min() if not history.empty else None} "
+          f"max={history['date'].max() if not history.empty else None}")
 
-    # 7d（直近7行）
+    # 7d（直近7営業日分）
     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
     plot_history_panel(ax, history.tail(7), f"{index_name} (7d)")
     save_png(fig, os.path.join(outputs_dir, f"{index_key}_7d.png"))
 
-    # 1m（便宜上 30行）
+    # 1m（直近30日）
     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
     plot_history_panel(ax, history.tail(30), f"{index_name} (1m)")
     save_png(fig, os.path.join(outputs_dir, f"{index_key}_1m.png"))
 
-    # 1y（便宜上 365行）
+    # 1y（直近365日）
     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
     plot_history_panel(ax, history.tail(365), f"{index_name} (1y)")
     save_png(fig, os.path.join(outputs_dir, f"{index_key}_1y.png"))
 
-    # 実行時刻メモ（CI の“出力有無確認”に便利）
     with open(os.path.join(outputs_dir, "_last_run.txt"), "w") as f:
         f.write(pd.Timestamp.now(tz=JP_TZ).isoformat())
-
 
 if __name__ == "__main__":
     main()
