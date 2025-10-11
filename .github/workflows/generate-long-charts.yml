@@ -1,10 +1,19 @@
-name: Generate long-term charts (R-BANK9)
+name: Generate long-term charts
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  # ここだけ各リポジトリに合わせて変更
+  INDEX_KEY: rbank9   # ← astra4 / scoin_plus / rbank9 のいずれか
+  # 日本市場は当日 09:00-15:30 を切り出し
+  CLAMP_SESSION: "true"
+  SESSION_START_JST: "09:00"
+  SESSION_END_JST:   "15:30"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   build:
@@ -32,14 +41,10 @@ jobs:
 
       # 1) 当日 intraday から履歴(date,value)に追記
       - name: Append daily history from intraday
-        env:
-          INDEX_KEY: rbank9
         run: python scripts/update_history.py
 
       # 2) 履歴を使って 7d/1m/1y、intraday で 1d を生成
       - name: Generate long-term charts
-        env:
-          INDEX_KEY: rbank9
         run: python scripts/long_charts.py
 
       - name: List AFTER
@@ -53,5 +58,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/outputs/*.png docs/outputs/*history.csv docs/outputs/_last_run.txt || true
-          git commit -m "chore(charts): update R-BANK9 long-term charts (1d/7d/1m/1y)" || echo "no changes"
+          git commit -m "chore(charts): update ${INDEX_KEY^^} long-term charts (1d/7d/1m/1y)" || echo "no changes"
           git push || true
