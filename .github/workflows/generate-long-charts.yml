@@ -18,22 +18,25 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # リポジトリ名から INDEX_KEY を自動推定（共通 yaml を各 repo で使えるように）
+      # リポジトリ名 → INDEX_KEY を小文字化して厳密マッピング
       - name: Resolve INDEX_KEY from repository
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          REPO="${GITHUB_REPOSITORY##*/}"
-          case "$REPO" in
-            3_Sakura_Space) KEY="astra4" ;;
-            S-COIN-)        KEY="scoin_plus" ;;
-            R-BANK9)        KEY="rbank9" ;;
-            AIN-10)         KEY="ain10" ;;
-            *)              echo "Unknown repo '$REPO' — set KEY=index"; KEY="index" ;;
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"            # 例: AIN-10 / S-COIN- / R-BANK9 / 3_Sakura_Space
+          REPO_LC="$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]')"  # 小文字化して比較の揺れを吸収
+
+          case "$REPO_LC" in
+            3_sakura_space) KEY="astra4" ;;
+            s-coin-)        KEY="scoin_plus" ;;
+            r-bank9)        KEY="rbank9" ;;
+            ain-10)         KEY="ain10" ;;
+            *)              echo "Unknown repo '$REPO_RAW' — fallback to KEY=index"; KEY="index" ;;
           esac
+
           echo "INDEX_KEY=$KEY" | tee -a "$GITHUB_ENV"
-          echo "Resolved INDEX_KEY=$KEY (from repo=$REPO)"
+          echo "Resolved INDEX_KEY=$KEY (from repo=$REPO_RAW → lower=$REPO_LC)"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -56,8 +59,10 @@ jobs:
           ls -lah docs/outputs || true
           echo "Existing PNGs:"
           ls -1 docs/outputs/*.png 2>/dev/null || true
+          echo "Existing markers:"
+          ls -1 docs/outputs/*_post_intraday.txt 2>/dev/null || true
 
-      # 日次履歴を intraday から更新（存在しない場合もエラーにしない）
+      # intraday → history 追記（存在しなくてもスキップ）
       - name: Append daily history from intraday
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -70,11 +75,10 @@ jobs:
             echo "scripts/update_history.py not found. Skip."
           fi
 
-      # 生成スクリプトの先頭を出力して、確実に新しいコードが走っていることをログで確認
+      # 実行するスクリプトの頭出し＆サンプル表示（デバッグしやすく）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
-          # 参考: セッション境界をコード側で持っているが、ログ目的で残しておく
           CLAMP_SESSION: "true"
           SESSION_START_JST: "09:00"
           SESSION_END_JST:   "15:30"
@@ -83,13 +87,54 @@ jobs:
           echo "=== running long_charts.py ==="
           ls -l scripts/
           echo "--- head scripts/long_charts.py ---"
-          head -n 60 scripts/long_charts.py || true
+          head -n 80 scripts/long_charts.py || true
           echo "--- sample intraday (if exists) ---"
           shopt -s nullglob
           for f in docs/outputs/*_intraday.csv; do
             echo ">> $f"; head -n 5 "$f"; done || true
           echo "----------------------------------"
           python scripts/long_charts.py
+
+      # 誤名のマーカーを正名へ正規化（再発してもここで補正）
+      - name: Normalize marker filenames
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+        shell: bash
+        run: |
+          set -e
+          OUTDIR="docs/outputs"
+
+          fix() {
+            local wrong="$1"
+            local right="$2"
+            if [ -f "$wrong" ] && [ "$wrong" != "$right" ]; then
+              echo "Rename marker: $wrong  ->  $right"
+              mv -f "$wrong" "$right"
+            fi
+          }
+
+          case "$INDEX_KEY" in
+            ain10)
+              fix "$OUTDIR/ain_10_post_intraday.txt" "$OUTDIR/ain10_post_intraday.txt"
+              ;;
+            scoin_plus)
+              fix "$OUTDIR/s_coin__post_intraday.txt" "$OUTDIR/scoin_plus_post_intraday.txt"
+              fix "$OUTDIR/scoin_plus_post.txt"       "$OUTDIR/scoin_plus_post_intraday.txt"
+              ;;
+            rbank9)
+              fix "$OUTDIR/r_bank9_post_intraday.txt" "$OUTDIR/rbank9_post_intraday.txt"
+              ;;
+            astra4)
+              # astra4 は誤名なし想定（必要に応じて追加）
+              :
+              ;;
+            *)
+              :
+              ;;
+          esac
+
+          echo "Markers after normalization:"
+          ls -1 "$OUTDIR"/*_post_intraday.txt 2>/dev/null || true
 
       - name: List AFTER
         run: |
