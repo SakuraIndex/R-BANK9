@@ -1,60 +1,66 @@
 # scripts/long_charts.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, re
+import os
+import re
 import pandas as pd
 import pytz
 import matplotlib
 import matplotlib.pyplot as plt
 
-# ---------- TZ ----------
+# ---- TZ ----
 JP = pytz.timezone("Asia/Tokyo")
 NY = pytz.timezone("America/New_York")
 
-# ---------- Theme ----------
+# ---- Theme ----
 BG, FG, TITLE = "#0E1117", "#E6E6E6", "#f2b6c6"
 UP, DOWN, GRID_A = "#3bd6c6", "#ff6b6b", 0.25
 
 matplotlib.rcParams.update({
-    "figure.facecolor": BG, "axes.facecolor": BG, "axes.edgecolor": FG,
-    "axes.labelcolor": FG, "xtick.color": FG, "ytick.color": FG,
-    "text.color": FG, "grid.color": FG, "savefig.facecolor": BG,
+    "figure.facecolor": BG,
+    "axes.facecolor": BG,
+    "axes.edgecolor": FG,
+    "axes.labelcolor": FG,
+    "xtick.color": FG,
+    "ytick.color": FG,
+    "text.color": FG,
+    "grid.color": FG,
+    "savefig.facecolor": BG,
 })
 
 OUTDIR = os.path.join("docs", "outputs")
 
-# 騰落率の異常値クリップ（指数ごとに少しだけ幅を変える）
-PCT_CLIP = {
-    "scoin_plus": 35.0,
-    "ain10": 25.0,
-    "astra4": 20.0,
-    "rbank9": 20.0,
-}
-
-# ---------- util ----------
+# ===== util =====
 def _lower(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
-def _find_time_col(cols: list[str]) -> str | None:
+def _find_time_col(cols) -> str | None:
     for c in cols:
         if re.search(r"time|日時|date|datetime|timestamp|時刻", c):
             return c
     return cols[0] if cols else None
 
-def _to_datetime_jst(series: pd.Series, colname: str) -> pd.Series:
-    # 文字列→時刻（tz-aware JST）
+def _parse_time(series: pd.Series) -> pd.Series:
     t = pd.to_datetime(series, errors="coerce", utc=True)
-    # もし tz が付いてなければ UTC とみなす
+    # もし tz 情報が無ければ UTC とみなす
     if getattr(t.dt, "tz", None) is None:
         t = pd.to_datetime(series, errors="coerce").dt.tz_localize("UTC")
-    # 列名に jst が含まれていれば JST 認識として扱う（最終的にJSTに統一）
+    # 画面表示・集計は JST に統一
     return t.dt.tz_convert(JP)
 
-def read_intraday(path: str) -> pd.DataFrame:
+def _rowwise_numeric_mean(df_num: pd.DataFrame) -> pd.Series:
+    """複数銘柄列があるケース（R-BANK9など）を行平均で 1 系列に畳み込む。"""
+    if df_num.shape[1] == 0:
+        return pd.Series([], dtype=float)
+    return df_num.mean(axis=1, skipna=True)
+
+def read_intraday(path: str, index_key: str) -> pd.DataFrame:
     """
-    intraday CSV を読み、汎用フォーマット DataFrame(time[JST tz-aware], value[float]) を返す。
-    値カラムが複数（例：R-BANK9 の銘柄別列）の場合は、**行方向平均**で単一系列にする。
+    CSV → DataFrame({"time","value"})
+    - time: tz-aware (JST)
+    - value: 1 系列（R-BANK9 等は行方向平均）
     """
     if not os.path.exists(path):
         return pd.DataFrame(columns=["time", "value"])
@@ -64,49 +70,41 @@ def read_intraday(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["time", "value"])
 
     df = _lower(raw)
-    tcol = _find_time_col(list(df.columns))
+    tcol = _find_time_col(df.columns)
     if tcol is None:
         return pd.DataFrame(columns=["time", "value"])
 
     # 時刻
-    t_jst = _to_datetime_jst(df[tcol], tcol)
+    t = _parse_time(df[tcol])
 
-    # 値候補列（time 以外）
-    cand_cols = [c for c in df.columns if c != tcol]
-    if not cand_cols:
+    # 数値列（time 以外を全部数値化）→ 行平均
+    num_cols = []
+    for c in df.columns:
+        if c == tcol:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().sum() > 0:
+            num_cols.append(s)
+
+    if not num_cols:
         return pd.DataFrame(columns=["time", "value"])
 
-    # 数値化できる列だけに絞る
-    num_df_list = []
-    for c in cand_cols:
-        num = pd.to_numeric(df[c], errors="coerce")
-        # 数がほぼ全部NaNなら捨てる
-        if num.notna().sum() >= max(3, int(0.1 * len(num))):  # 1割以上が数字なら残す
-            num_df_list.append(num)
+    df_num = pd.concat(num_cols, axis=1)
+    v = _rowwise_numeric_mean(df_num)
 
-    if not num_df_list:
-        # どうしても見つからない場合は最初の列を数値化して使う
-        num_df_list = [pd.to_numeric(df[cand_cols[0]], errors="coerce")]
-
-    # 列が複数ある場合は**平均**（指数の等加重と整合）
-    if len(num_df_list) == 1:
-        value = num_df_list[0]
-    else:
-        value = pd.concat(num_df_list, axis=1).mean(axis=1)
-
-    out = pd.DataFrame({"time": t_jst, "value": value})
+    out = pd.DataFrame({"time": t, "value": v})
     out = out.dropna(subset=["time", "value"]).sort_values("time").reset_index(drop=True)
     return out
 
-def resample(df: pd.DataFrame, rule: str = "1min") -> pd.DataFrame:
+def resample_1min(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    g = df.set_index("time").sort_index()[["value"]].resample(rule).mean()
+    g = df.set_index("time").sort_index()[["value"]].resample("1min").mean()
     g["value"] = g["value"].interpolate(limit_direction="both")
     return g.reset_index()
 
 def pick_window(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    """指数ごとの“当日ウィンドウ”選択。空なら最後の数百点を返す。"""
+    """指数ごとの当日ウィンドウ切り出し（fallback: 前営業日 / 直近 N 点）"""
     if df.empty:
         return df
     now_jst = pd.Timestamp.now(tz=JP)
@@ -116,47 +114,77 @@ def pick_window(df: pd.DataFrame, key: str) -> pd.DataFrame:
         s = pd.Timestamp(f"{today.date()} 09:00", tz=JP)
         e = pd.Timestamp(f"{today.date()} 15:30", tz=JP)
         w = df[(df["time"] >= s) & (df["time"] <= e)]
+        if w.empty:
+            y = today - pd.Timedelta(days=1)
+            s2 = pd.Timestamp(f"{y.date()} 09:00", tz=JP)
+            e2 = pd.Timestamp(f"{y.date()} 15:30", tz=JP)
+            w = df[(df["time"] >= s2) & (df["time"] <= e2)]
     elif key == "ain10":
         tny = df["time"].dt.tz_convert(NY)
         day = pd.Timestamp.now(tz=NY).normalize()
         s = pd.Timestamp(f"{day.date()} 09:30", tz=NY)
         e = pd.Timestamp(f"{day.date()} 16:00", tz=NY)
         w = df[(tny >= s) & (tny <= e)]
-    else:  # scoin_plus（24h ローリング）
+        if w.empty:
+            y = day - pd.Timedelta(days=1)
+            s2 = pd.Timestamp(f"{y.date()} 09:30", tz=NY)
+            e2 = pd.Timestamp(f"{y.date()} 16:00", tz=NY)
+            w = df[(tny >= s2) & (tny <= e2)]
+    else:  # scoin_plus
+        # 直近 24h を対象に
         w = df[df["time"] >= (pd.Timestamp.now(tz=JP) - pd.Timedelta(hours=24))]
 
     if w.empty:
-        # 直近日のセッションにデータなし → 末尾から数百点で描画（予防）
-        return df.tail(600).reset_index(drop=True)
+        w = df.tail(600)
     return w.reset_index(drop=True)
 
-def decide_pct(series_vals: pd.Series, key: str) -> float | None:
-    """
-    系列値から騰落率(%)を安定推定。
-    値が ±10 以内なら「%ポイント系」とみなし (last - base) * 100。
-    それ以上に広いなら倍率系 ((last/base - 1) * 100) を採用。
-    """
-    s = pd.to_numeric(series_vals, errors="coerce").dropna()
+# ---- % 計算：指数別の明示ロジック ----
+CAPS = {
+    "scoin_plus": 50.0,   # 仮想通貨（%ポイント積み上げ）上限
+    "ain10": 25.0,        # 米株10銘柄指数
+    "astra4": 20.0,
+    "rbank9": 20.0,
+}
+
+def _clip(x: float | None, cap: float) -> float | None:
+    if x is None:
+        return None
+    if x > cap:
+        return cap
+    if x < -cap:
+        return -cap
+    return x
+
+def pct_for_scoin_plus(values: pd.Series) -> float | None:
+    """S-COIN+ は 1 分足の“%ポイント”が並んでいる → 複利積み上げ"""
+    s = pd.to_numeric(values, errors="coerce").dropna()
     if len(s) < 2:
         return None
-    base, last = float(s.iloc[0]), float(s.iloc[-1])
-    vmin, vmax = float(s.min()), float(s.max())
+    # 値は %ポイント とみなし、/100 して積み上げ
+    prod = 1.0
+    for v in s.values:
+        prod *= (1.0 + (float(v) / 100.0))
+    return (prod - 1.0) * 100.0
 
-    cap = PCT_CLIP.get(key, 25.0)
+def pct_for_level(values: pd.Series) -> float | None:
+    """水準系列（Astra4 / R-BANK9 / AIN-10）: 始値比"""
+    s = pd.to_numeric(values, errors="coerce").dropna()
+    if len(s) < 2:
+        return None
+    first = float(s.iloc[0])
+    last = float(s.iloc[-1])
+    if abs(first) < 1e-9:
+        return None
+    return ((last / first) - 1.0) * 100.0
 
-    def clip(p: float) -> float:
-        return max(-cap, min(cap, p))
-
-    width = abs(vmax - vmin)
-    if width <= 10.0:
-        pct = (last - base) * 100.0
-    elif abs(base) > 1e-9 and (base * last) > 0:
-        pct = ((last / base) - 1.0) * 100.0
+def calc_delta_percent(key: str, values: pd.Series) -> float | None:
+    if key == "scoin_plus":
+        p = pct_for_scoin_plus(values)
     else:
-        pct = (last - base) * 100.0
+        p = pct_for_level(values)
+    return _clip(p, CAPS.get(key, 30.0))
 
-    return clip(pct)
-
+# ---- draw ----
 def decorate(ax, title, xl, yl):
     ax.set_title(title, color=TITLE, fontsize=20, pad=12)
     ax.set_xlabel(xl)
@@ -169,6 +197,7 @@ def save(fig, path):
     fig.savefig(path, facecolor=BG, bbox_inches="tight")
     plt.close(fig)
 
+# ===== main =====
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
     key = os.environ.get("INDEX_KEY", "index").strip().lower()
@@ -177,28 +206,26 @@ def main():
     intraday_csv = os.path.join(OUTDIR, f"{key}_intraday.csv")
     history_csv = os.path.join(OUTDIR, f"{key}_history.csv")
 
-    # intraday を強靭に読み込む
+    # 1) intraday 読み込み → 切り出し → 1分足化
     try:
-        i = read_intraday(intraday_csv)
+        i = read_intraday(intraday_csv, key)
         i = pick_window(i, key)
-        i = resample(i, "1min")
+        i = resample_1min(i)
     except Exception as e:
         print("intraday load fail:", e)
         i = pd.DataFrame(columns=["time", "value"])
 
-    # 騰落率と色（実値の変化も併用して決定）
-    delta = decide_pct(i["value"], key) if not i.empty else None
-    if not i.empty:
-        real_change = float(i["value"].iloc[-1] - i["value"].iloc[0])
-    else:
-        real_change = 0.0
-    color = UP if (delta is None or (delta >= 0 and real_change >= 0)) else DOWN
+    # 2) 騰落率（指数別の“正しい”ロジック）
+    delta = calc_delta_percent(key, i["value"]) if not i.empty else None
+
+    # 3) 線色（騰落率と一致）
+    line_color = UP if (delta is not None and delta >= 0) else DOWN
 
     # ---- 1d ----
     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
     decorate(ax, f"{name} (1d)", "Time", "Index Value")
     if not i.empty:
-        ax.plot(i["time"], i["value"], lw=2.2, color=color)
+        ax.plot(i["time"], i["value"], lw=2.2, color=line_color)
     else:
         ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
                 ha="center", va="center", alpha=0.6)
@@ -208,9 +235,12 @@ def main():
     if os.path.exists(history_csv):
         try:
             h = pd.read_csv(history_csv)
-            if "date" in h and "value" in h:
-                h["date"] = pd.to_datetime(h["date"], errors="coerce")
-                h["value"] = pd.to_numeric(h["value"], errors="coerce")
+            if {"date", "value"}.issubset({c.lower() for c in h.columns}):
+                # 列名を素直に参照（大小区別なし対応）
+                cols = {c.lower(): c for c in h.columns}
+                h["date"] = pd.to_datetime(h[cols["date"]], errors="coerce")
+                h["value"] = pd.to_numeric(h[cols["value"]], errors="coerce")
+
                 for days, label in [(7, "7d"), (30, "1m"), (365, "1y")]:
                     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
                     decorate(ax, f"{name} ({label})", "Date", "Index Value")
@@ -223,13 +253,12 @@ def main():
                                 ha="center", va="center", alpha=0.5)
                     save(fig, os.path.join(OUTDIR, f"{key}_{label}.png"))
         except Exception as e:
-            print("history load/plot fail:", e)
+            print("history draw fail:", e)
 
-    # ---- サイト用の % テキスト（intraday優先）----
-    txt_value = 0.0 if delta is None else float(delta)
-    with open(os.path.join(OUTDIR, f"{key}_post_intraday.txt"),
-              "w", encoding="utf-8") as f:
-        f.write(f"{name} 1d: {txt_value:+0.2f}%")
+    # 4) サイト用の % テキスト
+    txt_val = 0.0 if delta is None else float(delta)
+    with open(os.path.join(OUTDIR, f"{key}_post_intraday.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{name} 1d: {txt_val:+0.2f}%")
 
 if __name__ == "__main__":
     main()
