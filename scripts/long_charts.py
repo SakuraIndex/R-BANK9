@@ -17,8 +17,9 @@ matplotlib.rcParams.update({
 })
 
 OUTDIR = os.path.join("docs", "outputs")
-KEY   = "rbank9"
-NAME  = "RBANK9"
+REPO = os.getenv("GITHUB_REPOSITORY", "")
+KEY = REPO.split("/")[-1].lower().replace("-", "_") if REPO else "index"
+NAME = KEY.upper()
 
 def _lower(df): df.columns=[str(c).strip() for c in df.columns]; return df
 def _find_time_col(cols):
@@ -27,7 +28,6 @@ def _find_time_col(cols):
     return cols[0] if cols else None
 
 def read_intraday(path:str)->pd.DataFrame:
-    """rbank9_intraday.csv → time(JST), value(合成値=等金額加重平均)"""
     if not os.path.exists(path): 
         return pd.DataFrame(columns=["time","value"])
     raw = pd.read_csv(path, dtype=str)
@@ -35,55 +35,31 @@ def read_intraday(path:str)->pd.DataFrame:
         return pd.DataFrame(columns=["time","value"])
     df = _lower(raw)
     tcol = _find_time_col(df.columns)
-    if tcol is None:
-        return pd.DataFrame(columns=["time","value"])
-
-    # すでに合成列があるか？
-    agg_candidates = [c for c in df.columns if c.strip().upper() in ("R_BANK9","RBANK9","R-BANK9")]
-    # 銘柄列（数値列）を拾う
-    num_cols = []
-    for c in df.columns:
-        if c == tcol: continue
-        try:
-            pd.to_numeric(df[c])
-            num_cols.append(c)
-        except Exception:
-            pass
-
-    # 等金額平均：合成列があればそれを採用、無ければ数値列の平均
-    if agg_candidates:
-        vseries = pd.to_numeric(df[agg_candidates[0]], errors="coerce")
-    else:
-        if not num_cols:
-            return pd.DataFrame(columns=["time","value"])
-        vseries = pd.to_numeric(df[num_cols], errors="coerce").mean(axis=1)
-
-    # time を JST tz-aware へ
+    if tcol is None: return pd.DataFrame(columns=["time","value"])
+    # 候補列
+    candidates = [c for c in df.columns if re.search(rf"{KEY}|value", c, re.I)]
+    vcol = candidates[0] if candidates else df.columns[-1]
     t = pd.to_datetime(df[tcol], errors="coerce", utc=True)
     if t.dt.tz is None:
-        t = pd.to_datetime(df[tcol], errors="coerce").dt.tz_localize("UTC")
+        t = t.dt.tz_localize("UTC")
     t = t.dt.tz_convert(JP)
-
-    out = pd.DataFrame({"time": t, "value": vseries})
-    out = out.dropna(subset=["time","value"]).sort_values("time").reset_index(drop=True)
-    return out
-
-def pick_window_jst(df: pd.DataFrame) -> pd.DataFrame:
-    """東証 09:00-15:30 の当日窓"""
-    if df.empty: return df
-    now_jst = pd.Timestamp.now(tz=JP)
-    today = now_jst.normalize()
-    s = pd.Timestamp(f"{today.date()} 09:00", tz=JP)
-    e = pd.Timestamp(f"{today.date()} 15:30", tz=JP)
-    w = df[(df["time"]>=s)&(df["time"]<=e)]
-    return (w if not w.empty else df.tail(600)).reset_index(drop=True)
+    out = pd.DataFrame({"time": t, "value": pd.to_numeric(df[vcol], errors="coerce")})
+    return out.dropna().sort_values("time")
 
 def calc_delta(series: pd.Series) -> float | None:
-    """等加重指数：差分×100（%ポイント近似）"""
+    """％変化率：(終値÷始値−1)*100"""
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) < 2: return None
     base, last = float(s.iloc[0]), float(s.iloc[-1])
-    return (last - base) * 100.0
+    if base == 0: return None
+    return (last / base - 1.0) * 100.0
+
+def pick_window(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    now = pd.Timestamp.now(tz=JP)
+    beg = now - pd.Timedelta(hours=24)
+    w = df[(df["time"]>=beg)&(df["time"]<=now)]
+    return w if not w.empty else df.tail(600)
 
 def decorate(ax, title, xl, yl):
     ax.set_title(title, color=TITLE, fontsize=20, pad=12)
@@ -96,49 +72,28 @@ def save(fig, path):
 
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
-    intraday_csv = os.path.join(OUTDIR, f"{KEY}_intraday.csv")
-    history_csv  = os.path.join(OUTDIR, f"{KEY}_history.csv")
+    csv = os.path.join(OUTDIR, f"{KEY}_intraday.csv")
+    hist = os.path.join(OUTDIR, f"{KEY}_history.csv")
 
-    try:
-        i = read_intraday(intraday_csv)
-        i = pick_window_jst(i)
-        if not i.empty:
-            i = (i.set_index("time")[["value"]]
-                   .resample("1min").mean()
-                   .interpolate(limit_direction="both")
-                   .reset_index())
-    except Exception as e:
-        print("intraday load fail:", e)
-        i = pd.DataFrame(columns=["time","value"])
-
-    delta = calc_delta(i["value"]) if not i.empty else None
+    df = read_intraday(csv)
+    df = pick_window(df)
+    if not df.empty:
+        df = (df.set_index("time").resample("1min").mean()
+              .interpolate(limit_direction="both").reset_index())
+    delta = calc_delta(df["value"]) if not df.empty else None
     color = UP if (delta is not None and delta >= 0) else DOWN
 
+    # 1d chart
     fig, ax = plt.subplots(figsize=(16,7), layout="constrained")
-    decorate(ax, f"{NAME} (1d)", "Time", "Index value")
-    if not i.empty:
-        ax.plot(i["time"], i["value"], lw=2.2, color=color)
+    decorate(ax, f"{NAME} (1d)", "Time", "Index Value")
+    if not df.empty:
+        ax.plot(df["time"], df["value"], lw=2.0, color=color)
     else:
-        ax.text(0.5,0.5,"No data", transform=ax.transAxes, ha="center", va="center", alpha=0.6)
+        ax.text(0.5,0.5,"No data", ha="center", va="center", transform=ax.transAxes)
     save(fig, os.path.join(OUTDIR, f"{KEY}_1d.png"))
 
-    if os.path.exists(history_csv):
-        h = pd.read_csv(history_csv)
-        if "date" in h and "value" in h:
-            h["date"]  = pd.to_datetime(h["date"], errors="coerce")
-            h["value"] = pd.to_numeric(h["value"], errors="coerce")
-            for days, label in [(7,"7d"),(30,"1m"),(365,"1y")]:
-                fig, ax = plt.subplots(figsize=(16,7), layout="constrained")
-                decorate(ax, f"{NAME} ({label})", "Date", "Index value")
-                hh = h.tail(days)
-                if len(hh) >= 2:
-                    col = UP if hh["value"].iloc[-1] >= hh["value"].iloc[0] else DOWN
-                    ax.plot(hh["date"], hh["value"], lw=2.0, color=col)
-                else:
-                    ax.text(0.5,0.5,"No data", transform=ax.transAxes, ha="center", va="center", alpha=0.5)
-                save(fig, os.path.join(OUTDIR, f"{KEY}_{label}.png"))
-
-    txt = f"R-BANK9 1d: {(0.0 if delta is None else delta):+0.2f}%"
+    # 出力テキスト
+    txt = f"{NAME} 1d: {(0.0 if delta is None else delta):+0.2f}%"
     with open(os.path.join(OUTDIR, f"{KEY}_post_intraday.txt"), "w", encoding="utf-8") as f:
         f.write(txt)
 
