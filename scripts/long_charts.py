@@ -22,18 +22,20 @@ matplotlib.rcParams.update({
 OUTDIR = os.path.join("docs", "outputs")
 
 # === Utility ===
-def _lower(df):
+def _lower(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
-def _find_time_col(cols):
-    for c in cols:
-        if re.search(r"time|日時|date|datetime|timestamp|時刻", c):
+def _find_time_col(cols) -> str | None:
+    # cols は pandas.Index なので list に変換して扱う
+    cols_list = list(cols)
+    for c in cols_list:
+        if re.search(r"time|日時|date|datetime|timestamp|時刻", str(c)):
             return c
-    return cols[0] if cols else None
+    return cols_list[0] if len(cols_list) > 0 else None  # ← ここを修正（truth value エラー回避）
 
-def _parse_time(series):
+def _parse_time(series: pd.Series) -> pd.Series:
     t = pd.to_datetime(series, errors="coerce", utc=True)
     if getattr(t.dt, "tz", None) is None:
         t = t.dt.tz_localize("UTC")
@@ -52,14 +54,18 @@ def read_intraday(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["time", "value"])
     t = _parse_time(df[tcol])
 
+    # あらゆる数値列を柔軟に抽出（日本語列・ティッカー列でもOK）
     num_cols = []
     for c in df.columns:
         if c == tcol:
             continue
-        # 列名・データ内容ともに柔軟に数値化
-        s = pd.to_numeric(df[c].str.replace(" ", "").str.replace(",", ""), errors="coerce")
+        s = pd.to_numeric(
+            df[c].astype(str).str.replace(" ", "").str.replace(",", ""),
+            errors="coerce",
+        )
         if s.notna().sum() > 0:
             num_cols.append(s)
+
     if not num_cols:
         print("⚠️ No numeric columns found in", path)
         return pd.DataFrame(columns=["time", "value"])
@@ -68,14 +74,14 @@ def read_intraday(path: str) -> pd.DataFrame:
     out = pd.DataFrame({"time": t, "value": v}).dropna().sort_values("time")
     return out.reset_index(drop=True)
 
-def resample_1min(df):
+def resample_1min(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     g = df.set_index("time").sort_index().resample("1min").mean()
     g["value"] = g["value"].interpolate(limit_direction="both")
     return g.reset_index()
 
-def pick_window(df, key):
+def pick_window(df: pd.DataFrame, key: str) -> pd.DataFrame:
     if df.empty:
         return df
     now_jst = pd.Timestamp.now(tz=JP)
@@ -96,45 +102,48 @@ def pick_window(df, key):
             y = day - pd.Timedelta(days=1)
             s2, e2 = pd.Timestamp(f"{y.date()} 09:30", tz=NY), pd.Timestamp(f"{y.date()} 16:00", tz=NY)
             w = df[(tny >= s2) & (tny <= e2)]
-    else:  # S-COIN+
+    else:  # scoin_plus は 24h ローリング
         w = df[df["time"] >= (pd.Timestamp.now(tz=JP) - pd.Timedelta(hours=24))]
     return (w if not w.empty else df.tail(600)).reset_index(drop=True)
 
 # === % change ===
 CAPS = {"scoin_plus": 50.0, "ain10": 25.0, "astra4": 20.0, "rbank9": 20.0}
 
-def _clip(v, cap): return None if v is None else max(-cap, min(cap, v))
+def _clip(v: float | None, cap: float) -> float | None:
+    return None if v is None else max(-cap, min(cap, v))
 
-def calc_percent(key, s):
+def calc_percent(key: str, s: pd.Series) -> float | None:
     s = pd.to_numeric(s, errors="coerce").dropna()
     if len(s) < 2:
         return None
     first, last = float(s.iloc[0]), float(s.iloc[-1])
     if abs(first) < 1e-12:
         return None
-    # S-COIN+ 特殊処理
+
     if key == "scoin_plus":
+        # 比率と累積の双方を試し、より現実的な（絶対値が小さい）方を採用
         p1 = (last - first) / abs(first) * 100.0
-        # 累積率も計算
         prod = 1.0
         for v in s:
             x = float(v)
             prod *= (1 + (x / 100.0 if abs(x) < 10 else x))
-        p2 = (prod - 1) * 100.0
+        p2 = (prod - 1.0) * 100.0
         p = min((p1, p2), key=lambda x: abs(x))
     else:
         p = (last / first - 1.0) * 100.0
+
     return _clip(p, CAPS.get(key, 30.0))
 
-def draw_chart(df, key, name, delta):
+def draw_chart(df: pd.DataFrame, key: str, name: str, delta: float | None) -> None:
     fig, ax = plt.subplots(figsize=(16, 7), layout="constrained")
     ax.set_title(f"{name} (1d)", color=TITLE, fontsize=20, pad=12)
     ax.set_xlabel("Time")
     ax.set_ylabel("Index Value")
     ax.grid(True, alpha=GRID_A)
-    for s in ax.spines.values(): s.set_color(FG)
+    for s in ax.spines.values():
+        s.set_color(FG)
 
-    # AIN-10などでも「終値 - 始値」で色を決定（騰落率がズレても視覚は一致）
+    # 視覚の色は「終値−始値」で決め、陰陽と線色を一致させる
     color = UP if (not df.empty and df["value"].iloc[-1] >= df["value"].iloc[0]) else DOWN
     if not df.empty:
         ax.plot(df["time"], df["value"], lw=2.2, color=color)
@@ -151,8 +160,10 @@ def main():
     df = read_intraday(os.path.join(OUTDIR, f"{key}_intraday.csv"))
     df = pick_window(df, key)
     df = resample_1min(df)
+
     delta = calc_percent(key, df["value"]) if not df.empty else None
     draw_chart(df, key, name, delta)
+
     with open(os.path.join(OUTDIR, f"{key}_post_intraday.txt"), "w", encoding="utf-8") as f:
         f.write(f"{name} 1d: {(0.0 if delta is None else delta):+0.2f}%")
 
