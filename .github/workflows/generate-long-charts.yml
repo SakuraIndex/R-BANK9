@@ -22,33 +22,34 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # リポジトリ名 → INDEX_KEY と マーケット設定
       - name: Resolve INDEX_KEY & market
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          REPO_RAW="${GITHUB_REPOSITORY##*/}"            # 例: AIN-10 / S-COIN- / R-BANK9 / 3_Sakura_Space
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"
           REPO_LC="$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]')"
 
           case "$REPO_LC" in
-            3_sakura_space) KEY="astra4";   TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;;
-            s-coin-)        KEY="scoin_plus";TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;; # 株式関連
-            r-bank9)        KEY="rbank9";    TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;;
-            ain-10)         KEY="ain10";     TZ="America/New_York";  S="09:30"; E="16:00" ;;
-            *)              KEY="index";     TZ="UTC";                S="00:00"; E="23:59" ;;
+            3_sakura_space) KEY="astra4";    TZ="Asia/Tokyo";        S="09:00"; E="15:30" ;;
+            s-coin-)        KEY="scoin_plus"; TZ="Asia/Tokyo";        S="09:00"; E="15:30" ;;
+            r-bank9)        KEY="rbank9";     TZ="Asia/Tokyo";        S="09:00"; E="15:30" ;;
+            ain-10)         KEY="ain10";      TZ="America/New_York"; S="09:30"; E="16:00" ;;
+            *)              KEY="index";      TZ="UTC";               S="00:00"; E="23:59" ;;
           esac
 
           echo "INDEX_KEY=$KEY" | tee -a "$GITHUB_ENV"
-          echo "market_tz=$TZ"   | tee -a "$GITHUB_OUTPUT"
-          echo "session_start=$S"| tee -a "$GITHUB_OUTPUT"
-          echo "session_end=$E"  | tee -a "$GITHUB_OUTPUT"
+          echo "market_tz=$TZ"   >> "$GITHUB_OUTPUT"
+          echo "session_start=$S" >> "$GITHUB_OUTPUT"
+          echo "session_end=$E"   >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - uses: actions/cache@v4
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -56,13 +57,18 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install deps
+        shell: bash
         run: |
+          set -euo pipefail
           python -V
           pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Clear pycache
-        run: rm -rf scripts/__pycache__ || true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf scripts/__pycache__ || true
 
       - name: Generate long-term charts
         env:
@@ -70,13 +76,13 @@ jobs:
           CLAMP_SESSION: "true"
           MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
           SESSION_START: ${{ steps.resolve.outputs.session_start }}
-          SESSION_END:   ${{ steps.resolve.outputs.session_end }}
+          SESSION_END: ${{ steps.resolve.outputs.session_end }}
+        shell: bash
         run: |
           set -euo pipefail
           python scripts/long_charts.py
 
-      # ファイル名の接頭辞チェック（KEY一致）
-      - name: Sanity check: filenames prefix
+      - name: Sanity check - filenames prefix
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         shell: bash
@@ -87,17 +93,26 @@ jobs:
           shopt -s nullglob
           for f in "$OUTDIR"/*; do
             base="$(basename "$f")"
-            [[ "$base" == "${INDEX_KEY}_"* ]] || { echo "❌ prefix mismatch: $base"; mismatched=1; }
+            if [[ "$base" != "${INDEX_KEY}_"* ]]; then
+              echo "❌ prefix mismatch: $base"
+              mismatched=1
+            fi
           done
-          [ $mismatched -eq 0 ] || { echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"; exit 1; }
+          if [ $mismatched -ne 0 ]; then
+            echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"
+            exit 1
+          fi
           echo "✅ Prefix check passed."
 
       - name: List outputs
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=== outputs ==="
           ls -lah docs/outputs || true
 
       - name: Commit charts if changed
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
