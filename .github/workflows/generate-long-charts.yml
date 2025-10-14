@@ -39,9 +39,9 @@ jobs:
           esac
 
           echo "INDEX_KEY=$KEY" | tee -a "$GITHUB_ENV"
-          echo "market_tz=$TZ"   >> "$GITHUB_OUTPUT"
-          echo "session_start=$S" >> "$GITHUB_OUTPUT"
-          echo "session_end=$E"   >> "$GITHUB_OUTPUT"
+          echo "market_tz=$TZ"       >> "$GITHUB_OUTPUT"
+          echo "session_start=$S"    >> "$GITHUB_OUTPUT"
+          echo "session_end=$E"      >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -82,6 +82,51 @@ jobs:
           set -euo pipefail
           python scripts/long_charts.py
 
+      # 旧接頭辞/誤名ファイルを新接頭辞に統一（重複時は旧名を削除）
+      - name: Normalize legacy filenames (rename old prefixes)
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTDIR="docs/outputs"
+          shopt -s nullglob
+
+          normalize_prefix() {
+            local wrong_prefix="$1"
+            local right_prefix="$2"
+            for f in "$OUTDIR"/${wrong_prefix}*; do
+              base="$(basename "$f")"
+              new="$OUTDIR/${base/$wrong_prefix/$right_prefix}"
+              if [ "$f" != "$new" ]; then
+                if [ -e "$new" ]; then
+                  rm -f "$f"
+                  echo "remove legacy duplicate: $base"
+                else
+                  mv -f "$f" "$new"
+                  echo "rename: $base -> $(basename "$new")"
+                fi
+              fi
+            done
+          }
+
+          case "$INDEX_KEY" in
+            rbank9)
+              normalize_prefix "r_bank9_" "rbank9_"
+              ;;
+            scoin_plus)
+              normalize_prefix "s_coin__" "scoin_plus_"
+              normalize_prefix "s_coin_"  "scoin_plus_"
+              ;;
+            ain10)
+              normalize_prefix "ain_10_" "ain10_"
+              ;;
+            astra4)
+              normalize_prefix "3_sakura_space_" "astra4_"
+              ;;
+          esac
+
+      # メタファイルは除外し、接頭辞を厳密チェック
       - name: Sanity check - filenames prefix
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
@@ -91,13 +136,18 @@ jobs:
           OUTDIR="docs/outputs"
           mismatched=0
           shopt -s nullglob
+
           for f in "$OUTDIR"/*; do
             base="$(basename "$f")"
+            case "$base" in
+              README.md|_last_run.txt) continue ;;
+            esac
             if [[ "$base" != "${INDEX_KEY}_"* ]]; then
               echo "❌ prefix mismatch: $base"
               mismatched=1
             fi
           done
+
           if [ $mismatched -ne 0 ]; then
             echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"
             exit 1
