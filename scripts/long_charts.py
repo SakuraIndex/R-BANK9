@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-桜Index: 長期チャート生成 & 日中騰落率の正規化出力（全指数共通版・最新版）
+桜Index: 長期チャート生成 & 日中騰落率の正規化出力（全指数共通・最新版）
 - intraday / history を読み、PNG(1d/7d/1m/1y, intraday) を生成
 - 値スケールを自動判定（price / pct / fraction）して 1d 変化率を % で算出
 - {KEY}_stats.json と {KEY}_post_intraday.txt を出力（サイト表示は stats.json を使用）
 
-変更点:
+ポイント:
 - history.csv の時刻列に 'date' を追加認識
-- 値列自動選択の際に time/timestamp/datetime/日時/date を除外
+- 値列自動選択時に time/timestamp/datetime/日時/date を除外
+- pandas 2.x 環境でも安全な tz-localize / tz-convert 処理に対応
 """
 
 import os
@@ -108,7 +109,12 @@ def _to_market_tz(ts_utc: pd.Series) -> pd.Series:
 def _session_bounds_for(ts_local: pd.Series) -> Tuple[datetime, datetime]:
     """最新営業日のセッション開始・終了のローカル時刻（マーケットTZ）を返す"""
     if ts_local.empty:
-        now_local = pd.Timestamp.utcnow().tz_localize("UTC").tz_convert(MARKET_TZ)
+        now_local = pd.Timestamp.utcnow()
+        # tz-aware/naiveの両対応
+        if now_local.tzinfo is None:
+            now_local = now_local.tz_localize("UTC").tz_convert(MARKET_TZ)
+        else:
+            now_local = now_local.tz_convert(MARKET_TZ)
         base_date = now_local.date()
     else:
         base_date = ts_local.iloc[-1].date()
@@ -153,9 +159,18 @@ def _plot_series(df: pd.DataFrame, title: str, outpath: Path):
 
 
 def _window_from_history(df_hist: pd.DataFrame, days: int) -> pd.DataFrame:
+    """過去 n 日のデータを抽出（history or intraday ベース）"""
     if df_hist is None or df_hist.empty:
         return pd.DataFrame(columns=["ts_utc", "value"])
-    cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=days)
+
+    now = pd.Timestamp.utcnow()
+    # tz-aware/naive の両対応
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+
+    cutoff = now - pd.Timedelta(days=days)
     return df_hist.loc[df_hist["ts_utc"] >= cutoff].copy()
 
 
