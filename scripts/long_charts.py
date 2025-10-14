@@ -2,13 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-桜Index: 日中騰落率の正規化出力（PNGは触らない版）
+桜Index: 日中騰落率の正規化出力（PNGは触らない）
 - intraday/history を読み、1d の変化率を % で算出
-- {KEY}_stats.json と {KEY}_post_intraday.txt のみ更新（既存PNGは上書きしない）
+- {KEY}_stats.json と {KEY}_post_intraday.txt だけ更新（既存PNGは上書きしない）
 
-ポイント
-- 値スケールを自動判定（price / pct / fraction）
-- 始値は「当日セッション内の最初の“非NaNかつ非ゼロ”」を採用（ダミー0.00を除外）
+仕様
+- スケールは指数ごとに強制マップ:
+    scoin_plus → "price"（水準）
+    rbank9, ain10 → "pct"（すでに％）
+    astra4 → "fraction"（小数リターン）
+  上記以外は自動判定（price / pct / fraction）
+- 始値は「当日セッション内の最初の“非NaNかつ非ゼロ”」を採用（ダミー0.00除外）
 - history.csv の時刻列に 'date' を追加認識
 - pandas 2.x でも安全な tz-localize / tz-convert に対応
 """
@@ -24,12 +28,19 @@ import pandas as pd
 OUTDIR = Path("docs/outputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-INDEX_KEY = os.environ.get("INDEX_KEY", "index")
+INDEX_KEY = os.environ.get("INDEX_KEY", "index").lower()
 MARKET_TZ = os.environ.get("MARKET_TZ", "Asia/Tokyo")
 SESSION_START = os.environ.get("SESSION_START", "09:00")
 SESSION_END   = os.environ.get("SESSION_END",   "15:30")
 CLAMP_SESSION = os.environ.get("CLAMP_SESSION", "true").lower() == "true"
 
+# ここで指数ごとのスケールを強制（必要なら追記）
+SCALE_MAP = {
+    "scoin_plus": "price",
+    "rbank9": "pct",
+    "ain10": "pct",
+    "astra4": "fraction",
+}
 
 # ========== ユーティリティ ==========
 def _pick_value_column(df: pd.DataFrame) -> str:
@@ -75,7 +86,6 @@ def _session_bounds_for(ts_local: pd.Series):
     s_h, s_m = map(int, SESSION_START.split(":"))
     e_h, e_m = map(int, SESSION_END.split(":"))
 
-    # pandas.Timestamp.combine は tz を受けないので、naive → tz_localize の順で作る
     start_naive = datetime.combine(base_date, dtime(hour=s_h, minute=s_m))
     end_naive   = datetime.combine(base_date, dtime(hour=e_h, minute=e_m))
     start = pd.Timestamp(start_naive).tz_localize(MARKET_TZ)
@@ -120,7 +130,7 @@ def _first_last_valid(vals: List[float]):
             continue
     return start, end
 
-def _detect_value_scale(s: float, e: float) -> str:
+def _detect_value_scale_auto(s: float, e: float) -> str:
     max_abs = max(abs(s), abs(e))
     if max_abs > 20:
         return "price"
@@ -129,17 +139,20 @@ def _detect_value_scale(s: float, e: float) -> str:
     else:
         return "pct"        # -1.2 → -1.2%
 
-def _compute_change_percent(vals: List[float]) -> Tuple[float, str]:
+def _compute_change_percent(vals: List[float], forced_scale: Optional[str]) -> Tuple[float, str]:
     s, e = _first_last_valid(vals)
     if s is None or e is None:
         return 0.0, "unknown"
-    scale = _detect_value_scale(s, e)
+
+    scale = forced_scale or _detect_value_scale_auto(s, e)
+
     if scale == "price":
         chg = (e / s - 1.0) * 100.0
     elif scale == "pct":
         chg = (e - s)                # すでに％
     else:  # fraction
         chg = (e - s) * 100.0        # 小数 → ％
+
     return round(chg, 6), scale
 
 
@@ -149,17 +162,16 @@ def main():
     history_csv  = OUTDIR / f"{INDEX_KEY}_history.csv"
 
     df_intraday = _read_csv_generic(intraday_csv) if intraday_csv.exists() else pd.DataFrame(columns=["ts_utc", "value"])
-    _ = _read_csv_generic(history_csv)  # 読めるかだけ事前検証（以後は使用しない）
+    _ = _read_csv_generic(history_csv)  # 形式チェックのみ
 
-    # 当日セッション（intradayのみでOK）
     df_1d = _clamp_session(df_intraday.copy())
 
     pct_1d, scale_used = 0.0, "unknown"
     if not df_1d.empty:
         vals = df_1d["value"].tolist()
-        pct_1d, scale_used = _compute_change_percent(vals)
+        forced = SCALE_MAP.get(INDEX_KEY)  # ここで強制
+        pct_1d, scale_used = _compute_change_percent(vals, forced)
 
-    # 出力（PNGは触らない）
     stats = {
         "index_key": INDEX_KEY,
         "pct_1d": pct_1d,
@@ -174,7 +186,7 @@ def main():
         encoding="utf-8"
     )
 
-    print(f"[{INDEX_KEY}] 1d change: {pct_1d:.3f}% (scale={scale_used})")
+    print(f"[{INDEX_KEY}] 1d change: {pct_1d:.3f}% (scale={scale_used}, forced={SCALE_MAP.get(INDEX_KEY)})")
     print(f"[{INDEX_KEY}] wrote stats & marker only (kept existing PNGs).")
 
 if __name__ == "__main__":
