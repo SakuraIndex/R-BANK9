@@ -61,6 +61,7 @@ def _to_market_tz(ts_utc: pd.Series) -> pd.Series:
     return ts_utc.dt.tz_convert(MARKET_TZ)
 
 def _session_bounds_for(ts_local: pd.Series):
+    """最新営業日のマーケットTZにおける当日セッション開始/終了時刻（tz-aware）を返す"""
     if ts_local.empty:
         now_local = pd.Timestamp.utcnow()
         if now_local.tzinfo is None:
@@ -70,10 +71,15 @@ def _session_bounds_for(ts_local: pd.Series):
         base_date = now_local.date()
     else:
         base_date = ts_local.iloc[-1].date()
+
     s_h, s_m = map(int, SESSION_START.split(":"))
     e_h, e_m = map(int, SESSION_END.split(":"))
-    start = pd.Timestamp.combine(base_date, dtime(hour=s_h, minute=s_m), tz=MARKET_TZ)
-    end   = pd.Timestamp.combine(base_date, dtime(hour=e_h, minute=e_m), tz=MARKET_TZ)
+
+    # pandas.Timestamp.combine は tz を受けないので、naive → tz_localize の順で作る
+    start_naive = datetime.combine(base_date, dtime(hour=s_h, minute=s_m))
+    end_naive   = datetime.combine(base_date, dtime(hour=e_h, minute=e_m))
+    start = pd.Timestamp(start_naive).tz_localize(MARKET_TZ)
+    end   = pd.Timestamp(end_naive).tz_localize(MARKET_TZ)
     if end <= start:
         end += pd.Timedelta(days=1)
     return start, end
@@ -143,7 +149,7 @@ def main():
     history_csv  = OUTDIR / f"{INDEX_KEY}_history.csv"
 
     df_intraday = _read_csv_generic(intraday_csv) if intraday_csv.exists() else pd.DataFrame(columns=["ts_utc", "value"])
-    df_history  = _read_csv_generic(history_csv)  if history_csv.exists()  else pd.DataFrame(columns=["ts_utc", "value"])
+    _ = _read_csv_generic(history_csv)  # 読めるかだけ事前検証（以後は使用しない）
 
     # 当日セッション（intradayのみでOK）
     df_1d = _clamp_session(df_intraday.copy())
