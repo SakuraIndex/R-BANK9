@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-桜Index: 長期チャート生成 & 日中騰落率の正規化出力（全指数共通版）
-- intraday/history を読み、PNG(1d/7d/1m/1y, intraday) を生成
-- 値スケール自動判定（price / pct / fraction）で 1d 変化率を % で算出
+桜Index: 長期チャート生成 & 日中騰落率の正規化出力（全指数共通版・最新版）
+- intraday / history を読み、PNG(1d/7d/1m/1y, intraday) を生成
+- 値スケールを自動判定（price / pct / fraction）して 1d 変化率を % で算出
 - {KEY}_stats.json と {KEY}_post_intraday.txt を出力（サイト表示は stats.json を使用）
+
+変更点:
+- history.csv の時刻列に 'date' を追加認識
+- 値列自動選択の際に time/timestamp/datetime/日時/date を除外
 """
 
 import os
@@ -33,28 +37,34 @@ PNG_LINEWIDTH = 1.5
 
 # ========== ユーティリティ ==========
 def _pick_value_column(df: pd.DataFrame) -> str:
-    """最右列（time/timestamp/datetime/日時 以外）を値列とみなす"""
-    candidates = [c for c in df.columns if c.lower() not in ("time", "timestamp", "datetime", "日時")]
+    """最右列（time/timestamp/datetime/日時/date 以外）を値列とみなす"""
+    skip = {"time", "timestamp", "datetime", "日時", "date"}
+    candidates = [c for c in df.columns if c.lower() not in skip]
     if not candidates:
-        raise ValueError("値列が見つかりませんでした")
+        raise ValueError("値列が見つかりませんでした（全列が時刻系でした）")
     return candidates[-1]
 
 
 def _read_csv_generic(path: Path) -> Optional[pd.DataFrame]:
+    """共通CSV読込: 時刻列→UTC正規化, 値列→float, ts_utc/value の2列を返す"""
     if not path.exists():
         return None
     df = pd.read_csv(path)
-    # 時刻列の正規化
-    time_cols = [c for c in df.columns if c.lower() in ("time", "timestamp", "datetime", "日時")]
+
+    # 時刻列の候補（date を追加）
+    time_cols = [c for c in df.columns if c.lower() in ("time", "timestamp", "datetime", "日時", "date")]
     if not time_cols:
-        raise ValueError(f"{path} に time/timestamp/datetime/日時 の列がありません")
+        raise ValueError(f"{path} に time/timestamp/datetime/日時/date の列がありません")
+
     tcol = time_cols[0]
     df["ts_utc"] = pd.to_datetime(df[tcol], utc=True, errors="coerce")
     df = df.dropna(subset=["ts_utc"]).sort_values("ts_utc").reset_index(drop=True)
+
     # 値列の抽出
     vcol = _pick_value_column(df)
     df["value"] = pd.to_numeric(df[vcol], errors="coerce")
     df = df.dropna(subset=["value"])
+
     return df[["ts_utc", "value"]]
 
 
@@ -68,9 +78,9 @@ def _detect_value_scale(values: List[float]) -> str:
     if max_abs > 20:
         return "price"      # 例: 100, 101
     elif max_abs < 1:
-        return "fraction"   # 例: 0.004, -0.012 （= 0.4%, -1.2%）
+        return "fraction"   # 例: 0.004, -0.012（= 0.4%, -1.2%）
     else:
-        return "pct"        # 例: -1.2, +0.5 （= 既に%単位）
+        return "pct"        # 例: -1.2, +0.5（= 既に%単位）
 
 
 def _compute_change_percent(values: List[float]) -> Tuple[float, str]:
@@ -121,7 +131,7 @@ def _clamp_session(df: pd.DataFrame) -> pd.DataFrame:
     mask = (ts_local >= start) & (ts_local <= end)
     out = df.loc[mask].copy()
     if out.empty:
-        # もし当日セッションにデータがなければ直近日の全データを返す
+        # 当日セッションにデータがなければ直近日の全データを返す
         last_day = ts_local.dt.date.iloc[-1]
         out = df.loc[ts_local.dt.date == last_day].copy()
     return out
@@ -163,9 +173,10 @@ def main():
     df_1d = _clamp_session(df_1d_raw)
 
     # 3) 7d/1m/1y ウィンドウ（history ベース / fallback intraday）
-    df_7d = _window_from_history(df_history if not df_history.empty else df_intraday, 7)
-    df_1m = _window_from_history(df_history if not df_history.empty else df_intraday, 31)
-    df_1y = _window_from_history(df_history if not df_history.empty else df_intraday, 366)
+    base_hist = df_history if not df_history.empty else df_intraday
+    df_7d = _window_from_history(base_hist, 7)
+    df_1m = _window_from_history(base_hist, 31)
+    df_1y = _window_from_history(base_hist, 366)
 
     # 4) 画像生成
     _plot_series(df_1d, f"{INDEX_KEY.upper()} (1d)", OUTDIR / f"{INDEX_KEY}_1d.png")
