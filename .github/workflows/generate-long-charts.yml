@@ -6,10 +6,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: long-charts-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
@@ -18,30 +22,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # リポジトリ名 → INDEX_KEY を小文字化して厳密マッピング
-      - name: Resolve INDEX_KEY from repository
+      # リポジトリ名 → INDEX_KEY と マーケット設定
+      - name: Resolve INDEX_KEY & market
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
           REPO_RAW="${GITHUB_REPOSITORY##*/}"            # 例: AIN-10 / S-COIN- / R-BANK9 / 3_Sakura_Space
-          REPO_LC="$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]')"  # 小文字化して比較の揺れを吸収
+          REPO_LC="$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]')"
 
           case "$REPO_LC" in
-            3_sakura_space) KEY="astra4" ;;
-            s-coin-)        KEY="scoin_plus" ;;
-            r-bank9)        KEY="rbank9" ;;
-            ain-10)         KEY="ain10" ;;
-            *)              echo "Unknown repo '$REPO_RAW' — fallback to KEY=index"; KEY="index" ;;
+            3_sakura_space) KEY="astra4";   TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;;
+            s-coin-)        KEY="scoin_plus";TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;; # 株式関連
+            r-bank9)        KEY="rbank9";    TZ="Asia/Tokyo";         S="09:00"; E="15:30" ;;
+            ain-10)         KEY="ain10";     TZ="America/New_York";  S="09:30"; E="16:00" ;;
+            *)              KEY="index";     TZ="UTC";                S="00:00"; E="23:59" ;;
           esac
 
           echo "INDEX_KEY=$KEY" | tee -a "$GITHUB_ENV"
-          echo "Resolved INDEX_KEY=$KEY (from repo=$REPO_RAW → lower=$REPO_LC)"
+          echo "market_tz=$TZ"   | tee -a "$GITHUB_OUTPUT"
+          echo "session_start=$S"| tee -a "$GITHUB_OUTPUT"
+          echo "session_end=$E"  | tee -a "$GITHUB_OUTPUT"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -49,114 +61,51 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Force clear pycache
+      - name: Clear pycache
         run: rm -rf scripts/__pycache__ || true
 
-      - name: List BEFORE
-        run: |
-          echo "CWD=$(pwd)"
-          ls -lah
-          ls -lah docs/outputs || true
-          echo "Existing PNGs:"
-          ls -1 docs/outputs/*.png 2>/dev/null || true
-          echo "Existing markers:"
-          ls -1 docs/outputs/*_post_intraday.txt 2>/dev/null || true
-
-      # intraday → history 追記（存在しなくてもスキップ）
-      - name: Append daily history from intraday
-        env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
-        run: |
-          set -e
-          if [ -f scripts/update_history.py ]; then
-            echo "Running update_history.py (INDEX_KEY=$INDEX_KEY)"
-            python scripts/update_history.py || true
-          else
-            echo "scripts/update_history.py not found. Skip."
-          fi
-
-      # 実行するスクリプトの頭出し＆サンプル表示（デバッグしやすく）
       - name: Generate long-term charts
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
           CLAMP_SESSION: "true"
-          SESSION_START_JST: "09:00"
-          SESSION_END_JST:   "15:30"
+          MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
+          SESSION_START: ${{ steps.resolve.outputs.session_start }}
+          SESSION_END:   ${{ steps.resolve.outputs.session_end }}
         run: |
-          set -e
-          echo "=== running long_charts.py ==="
-          ls -l scripts/
-          echo "--- head scripts/long_charts.py ---"
-          head -n 80 scripts/long_charts.py || true
-          echo "--- sample intraday (if exists) ---"
-          shopt -s nullglob
-          for f in docs/outputs/*_intraday.csv; do
-            echo ">> $f"; head -n 5 "$f"; done || true
-          echo "----------------------------------"
+          set -euo pipefail
           python scripts/long_charts.py
 
-      # 誤名のマーカーを正名へ正規化（再発してもここで補正）
-      - name: Normalize marker filenames
+      # ファイル名の接頭辞チェック（KEY一致）
+      - name: Sanity check: filenames prefix
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           OUTDIR="docs/outputs"
+          mismatched=0
+          shopt -s nullglob
+          for f in "$OUTDIR"/*; do
+            base="$(basename "$f")"
+            [[ "$base" == "${INDEX_KEY}_"* ]] || { echo "❌ prefix mismatch: $base"; mismatched=1; }
+          done
+          [ $mismatched -eq 0 ] || { echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"; exit 1; }
+          echo "✅ Prefix check passed."
 
-          fix() {
-            local wrong="$1"
-            local right="$2"
-            if [ -f "$wrong" ] && [ "$wrong" != "$right" ]; then
-              echo "Rename marker: $wrong  ->  $right"
-              mv -f "$wrong" "$right"
-            fi
-          }
-
-          case "$INDEX_KEY" in
-            ain10)
-              fix "$OUTDIR/ain_10_post_intraday.txt" "$OUTDIR/ain10_post_intraday.txt"
-              ;;
-            scoin_plus)
-              fix "$OUTDIR/s_coin__post_intraday.txt" "$OUTDIR/scoin_plus_post_intraday.txt"
-              fix "$OUTDIR/scoin_plus_post.txt"       "$OUTDIR/scoin_plus_post_intraday.txt"
-              ;;
-            rbank9)
-              fix "$OUTDIR/r_bank9_post_intraday.txt" "$OUTDIR/rbank9_post_intraday.txt"
-              ;;
-            astra4)
-              # astra4 は誤名なし想定（必要に応じて追加）
-              :
-              ;;
-            *)
-              :
-              ;;
-          esac
-
-          echo "Markers after normalization:"
-          ls -1 "$OUTDIR"/*_post_intraday.txt 2>/dev/null || true
-
-      - name: List AFTER
+      - name: List outputs
         run: |
-          echo "=== AFTER ==="
+          echo "=== outputs ==="
           ls -lah docs/outputs || true
-          echo "Generated PNGs:"
-          ls -1 docs/outputs/*.png 2>/dev/null || true
-          echo "Txt markers:"
-          ls -1 docs/outputs/*_post_intraday.txt 2>/dev/null || true
-          echo "-- git status --"
-          git status --porcelain
 
       - name: Commit charts if changed
         run: |
-          set -e
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/*.png docs/outputs/*history.csv docs/outputs/*_post_intraday.txt 2>/dev/null || true
+          git add docs/outputs/*.png docs/outputs/*history.csv docs/outputs/*_post_intraday.txt docs/outputs/*_stats.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            MSG="chore(charts): update long-term charts (1d/7d/1m/1y)"
-            git commit -m "$MSG"
+            git commit -m "chore(charts): update long-term charts (1d/7d/1m/1y) & stats"
             git push
           fi
