@@ -1,0 +1,154 @@
+name: Auto intraday & close (5min, market-aware)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * 1-5"   # 平日5分おき（UTC）。市場時間の判定はジョブ内でTZ計算します
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # どのリポかから INDEX_KEY / MARKET_TZ / セッション時刻 / 使うスクリプト を決める
+      - name: Resolve repo → index settings
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_RAW="${GITHUB_REPOSITORY##*/}"
+          REPO_LC="$(echo "$REPO_RAW" | tr '[:upper:]' '[:lower:]')"
+
+          case "$REPO_LC" in
+            3_sakura_space)
+              KEY="astra4"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/astra4_intraday.py" ;;
+            s-coin-)
+              KEY="scoin_plus"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/scoin_plus_intraday.py" ;;
+            r-bank9)
+              KEY="rbank9"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/rbank9_intraday.py" ;;
+            ain-10)
+              KEY="ain10"; TZ="America/New_York"; S="09:30"; E="16:00"; INTRA="src/ain10_snapshot.py" ;; # ←このファイル名はリポに合わせて。違えば修正してください
+            *)
+              echo "Unknown repo: $REPO_RAW"; exit 1 ;;
+          esac
+
+          echo "INDEX_KEY=$KEY"       | tee -a "$GITHUB_ENV"
+          echo "MARKET_TZ=$TZ"        | tee -a "$GITHUB_ENV"
+          echo "SESSION_START=$S"     | tee -a "$GITHUB_ENV"
+          echo "SESSION_END=$E"       | tee -a "$GITHUB_ENV"
+          echo "INTRA_SCRIPT=$INTRA"  | tee -a "$GITHUB_ENV"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute session flags (DST-aware)
+        id: flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          from datetime import datetime, time, timedelta
+          from zoneinfo import ZoneInfo
+          import os
+          tz = ZoneInfo(os.environ["MARKET_TZ"])
+          s_h, s_m = map(int, os.environ["SESSION_START"].split(":"))
+          e_h, e_m = map(int, os.environ["SESSION_END"].split(":"))
+          now = datetime.now(tz)
+          start = datetime.combine(now.date(), time(s_h, s_m, tzinfo=tz))
+          end   = datetime.combine(now.date(), time(e_h, e_m, tzinfo=tz))
+          if end <= start:
+              end += timedelta(days=1)
+          # 窓判定
+          in_session = start <= now <= end
+          # クローズ後の確定生成は終了後 +[0,20) 分の“窓”で一度だけ
+          at_close_window = end <= now < end + timedelta(minutes=20)
+          # すでに確定処理を終えたか（docs/outputs/_last_run.txt に close-YYYY-MM-DD を記録）
+          last_flag = ""
+          try:
+              with open("docs/outputs/_last_run.txt","r",encoding="utf-8") as f:
+                  last_flag = f.read().strip()
+          except FileNotFoundError:
+              pass
+          close_key = f"close-{now.date()}"
+          already_closed = (last_flag == close_key)
+          print(f"in_session={in_session}, at_close_window={at_close_window}, already_closed={already_closed}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
+              g.write(f"in_session={'true' if in_session else 'false'}\n")
+              g.write(f"at_close={'true' if at_close_window else 'false'}\n")
+              g.write(f"already_closed={'true' if already_closed else 'false'}\n")
+              g.write(f"close_key={close_key}\n")
+          PY
+
+      # 営業時間中：5分おきにintradayを更新・コミット
+      - name: Run intraday (every 5 min during session)
+        if: steps.flags.outputs.in_session == 'true'
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          MARKET_TZ: ${{ env.MARKET_TZ }}
+          SESSION_START: ${{ env.SESSION_START }}
+          SESSION_END: ${{ env.SESSION_END }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== intraday =="
+          python "$INTRA_SCRIPT" || true
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/*intraday.* docs/outputs/*intraday.png 2>/dev/null || true
+          git commit -m "chore(intraday): ${INDEX_KEY}" || echo "no intraday changes"
+          git push || true
+
+      # クローズ直後：確定値のhistory追記＆長期PNG＆statsを一度だけ生成
+      - name: Run close tasks (history/long charts/stats once)
+        if: steps.flags.outputs.at_close == 'true' && steps.flags.outputs.already_closed != 'true'
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          MARKET_TZ: ${{ env.MARKET_TZ }}
+          SESSION_START: ${{ env.SESSION_START }}
+          SESSION_END: ${{ env.SESSION_END }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== close window =="
+          # まず当日分をhistoryに反映（存在すれば）
+          if [ -f scripts/update_history.py ]; then
+            python scripts/update_history.py || true
+          fi
+          # 長期チャート＆stats（既存の long_charts.py を利用）
+          python scripts/long_charts.py
+          # 実行フラグを書き込んで二重実行を抑止
+          echo "${{ steps.flags.outputs.close_key }}" > docs/outputs/_last_run.txt
+          # 旧接頭辞の正規化（命名揺れ対策）
+          OUT="docs/outputs"; shopt -s nullglob
+          norm() { for f in "$OUT"/$1*; do base="$(basename "$f")"; new="$OUT/${base/$1/$2}"; [ "$f" = "$new" ] || mv -f "$f" "$new"; done; }
+          case "$INDEX_KEY" in
+            ain10)      norm "ain_10_" "ain10_";;
+            rbank9)     norm "r_bank9_" "rbank9_";;
+            scoin_plus) norm "s_coin__" "scoin_plus_"; norm "s_coin_" "scoin_plus_";;
+            astra4)     norm "3_sakura_space_" "astra4_";;
+          esac
+          # コミット
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/* 2>/dev/null || true
+          git commit -m "chore(close): ${INDEX_KEY} long charts & stats" || echo "no close changes"
+          git push || true
