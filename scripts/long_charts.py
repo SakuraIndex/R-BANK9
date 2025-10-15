@@ -53,12 +53,10 @@ def gen_pngs():
 def write_stats():
     """
     R-BANK9 は intraday が %単位。
-    → 1日騰落率[%] = last_value
+    → 騰落率[%] = last_value
     """
     df = _load_df(); col = df.columns[-1]
-    pct = None
-    if len(df):
-        pct = float(df[col].iloc[-1])
+    pct = float(df[col].iloc[-1]) if len(df) else None
 
     payload = {
         "index_key": INDEX_KEY,
@@ -67,8 +65,11 @@ def write_stats():
         "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
     }
     (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
     if pct is not None:
-        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8")
+        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(
+            f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8"
+        )
 
 if __name__ == "__main__":
     gen_pngs()
