@@ -1,105 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-R-BANK9 index chart generator
-Generates 1d / 7d / 1m / 1y PNG charts + JSON stats marker.
+R-BANK9 charts + stats
 """
-import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import pandas as pd
+import matplotlib.pyplot as plt
 
-# ==========================================================
-# ---- CONFIG ----
 INDEX_KEY = "rbank9"
-OUTDIR = Path("docs/outputs")
-OUTDIR.mkdir(parents=True, exist_ok=True)
+OUTDIR = Path("docs/outputs"); OUTDIR.mkdir(parents=True, exist_ok=True)
 HISTORY_CSV = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
-# ==========================================================
 
-# ---- Dark theme style ----
-DARK_BG = "#0e0f13"
-DARK_AX = "#0b0c10"
-FG_TEXT = "#e7ecf1"
-LINE = "#2a2e3a"
-RED = "#ff6b6b"
+DARK_BG = "#0e0f13"; DARK_AX = "#0b0c10"; FG_TEXT = "#e7ecf1"
+GRID = "#2a2e3a"; RED = "#ff6b6b"
 
-
-def _apply_common_style(ax, title):
-    fig = ax.figure
-    fig.set_size_inches(12, 7)
-    fig.set_dpi(160)
-    fig.patch.set_facecolor(DARK_BG)
-    ax.set_facecolor(DARK_AX)
-    for sp in ax.spines.values():
-        sp.set_color(LINE)
-    ax.grid(color=LINE, alpha=0.35, linewidth=0.6)
+def _apply(ax, title):
+    fig = ax.figure; fig.set_size_inches(12, 7); fig.set_dpi(160)
+    fig.patch.set_facecolor(DARK_BG); ax.set_facecolor(DARK_AX)
+    for sp in ax.spines.values(): sp.set_color(GRID)
+    ax.grid(color=GRID, alpha=0.6, linewidth=0.8)
     ax.tick_params(colors=FG_TEXT, labelsize=10)
-    ax.yaxis.get_major_formatter().set_scientific(False)  # remove "1e13+..."
+    ax.yaxis.get_major_formatter().set_scientific(False)
     ax.set_title(title, color=FG_TEXT, fontsize=12)
     ax.set_xlabel("Time", color=FG_TEXT, fontsize=10)
-    ax.set_ylabel("Index Value", color=FG_TEXT, fontsize=10)
+    ax.set_ylabel("Index / Value", color=FG_TEXT, fontsize=10)
 
-
-def save_line_png(df, col, out_png, title):
-    """Draw a clean dark-mode line chart."""
+def _save(df, col, out_png, title):
     fig, ax = plt.subplots()
-    _apply_common_style(ax, title)
-    ax.plot(df.index, df[col], linewidth=1.6, color=RED)
+    _apply(ax, title)
+    ax.plot(df.index, df[col], color=RED, linewidth=1.6)
     fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
-
-def load_latest_df():
-    """Prefer intraday CSV if available, else fallback to history."""
+def _load_df():
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
     elif HISTORY_CSV.exists():
         df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
     else:
-        raise FileNotFoundError("No data CSV found for R-BANK9")
-    df = df.dropna()
-    return df
+        raise FileNotFoundError("no csv")
+    return df.dropna()
 
+def gen_pngs():
+    df = _load_df(); col = df.columns[-1]
+    _save(df.tail(1000), col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
+    _save(df.tail(7*1000), col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
+    _save(df, col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
+    _save(df, col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
 
-def generate_all_charts():
-    df = load_latest_df()
-    col = df.columns[-1]
-    save_line_png(df.tail(1000), col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
-    save_line_png(df.tail(7 * 1000), col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
-    save_line_png(df, col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
-    save_line_png(df, col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
-    print("[INFO] PNG charts generated.")
-
-
-def write_stats_and_marker():
-    df = load_latest_df()
-    col = df.columns[-1]
+def write_stats():
+    """
+    R-BANK9 は intraday が %単位。
+    → 1日騰落率[%] = last_value
+    """
+    df = _load_df(); col = df.columns[-1]
     pct = None
-    if len(df) >= 2:
-        pct = (float(df[col].iloc[-1]) / float(df[col].iloc[0]) - 1.0) * 100.0
-    now_iso = pd.Timestamp.utcnow().isoformat() + "Z"
+    if len(df):
+        pct = float(df[col].iloc[-1])
 
-    stats = {
+    payload = {
         "index_key": INDEX_KEY,
-        "pct_1d": pct,
+        "pct_1d": None if pct is None else pct,
         "scale": "pct",
-        "updated_at": now_iso,
+        "updated_at": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(stats, ensure_ascii=False), encoding="utf-8")
-
+    (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     if pct is not None:
-        marker = f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%"
-        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(marker + "\n", encoding="utf-8")
-        print("[INFO] Marker written:", marker)
-    else:
-        print("[WARN] Could not compute 1d pct")
-
+        (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(f"{INDEX_KEY.upper()} 1d: {pct:+.2f}%\n", encoding="utf-8")
 
 if __name__ == "__main__":
-    try:
-        generate_all_charts()
-        write_stats_and_marker()
-    except Exception as e:
-        print("[ERROR] Failed:", e)
+    gen_pngs()
+    write_stats()
