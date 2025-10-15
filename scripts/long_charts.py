@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-R-BANK9 charts + stats  (level → pct scale, dark theme, color-coded)
+R-BANK9 charts + stats  (pct scale, dark theme, auto line-color)
+- 画像の背景/枠はダークで統一
+- 線色は「当日の始値→終値」で自動切替（上昇=緑、下落=赤、横ばい=灰）
+- stats.json は pct（百分率, 例: +1.23）で出力し、サイトと整合
 """
+
 from pathlib import Path
 import json
 from datetime import datetime, timezone
@@ -22,19 +26,20 @@ INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 # ------------------------
 # plotting style (dark)
 # ------------------------
-DARK_BG = "#0e0f13"
-DARK_AX = "#0b0c10"
+DARK_BG = "#0e0f13"   # 図の背景
+DARK_AX = "#0b0c10"   # 軸(プロット領域)の背景  ← サイト側と同色
 FG_TEXT = "#e7ecf1"
 GRID    = "#2a2e3a"
-GREEN   = "#28e07c"   # 上昇
-RED     = "#ff4d4d"   # 下落
+POS     = "#4caf50"   # 上昇時の線色（緑）
+NEG     = "#ff6b6b"   # 下落時の線色（赤）
+NEU     = "#cfcfcf"   # 変化なし/データ不足の線色（灰）
 
 def _apply(ax, title: str) -> None:
     fig = ax.figure
     fig.set_size_inches(12, 7)
     fig.set_dpi(160)
-    fig.patch.set_facecolor(DARK_BG)
-    ax.set_facecolor(DARK_AX)
+    fig.patch.set_facecolor(DARK_BG)   # 図全体の背景
+    ax.set_facecolor(DARK_AX)          # プロット領域の背景
     for sp in ax.spines.values():
         sp.set_color(GRID)
     ax.grid(color=GRID, alpha=0.6, linewidth=0.8)
@@ -44,20 +49,26 @@ def _apply(ax, title: str) -> None:
     ax.set_xlabel("Time", color=FG_TEXT, fontsize=10)
     ax.set_ylabel("Index / Value", color=FG_TEXT, fontsize=10)
 
-def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
-    """
-    チャート生成。開始値と終了値から色を決定。
-    """
-    if len(df) < 2:
-        color = FG_TEXT
-    else:
-        first = df[col].iloc[0]
-        last = df[col].iloc[-1]
-        color = GREEN if last >= first else RED
+def _trend_color(series: pd.Series) -> str:
+    """シリーズの先頭と末尾で上昇/下落/横ばいを判定して線色を返す"""
+    if series is None or len(series) < 2:
+        return NEU
+    start = series.iloc[0]
+    end   = series.iloc[-1]
+    if pd.isna(start) or pd.isna(end):
+        return NEU
+    if end > start:
+        return POS
+    if end < start:
+        return NEG
+    return NEU
 
+def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
     fig, ax = plt.subplots()
     _apply(ax, title)
+    color = _trend_color(df[col])
     ax.plot(df.index, df[col], color=color, linewidth=1.6)
+    # 画像にも背景色を埋め込む（透過PNGでもサイト側と完全一致）
     fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -66,7 +77,7 @@ def _save(df: pd.DataFrame, col: str, out_png: Path, title: str) -> None:
 # ------------------------
 def _pick_index_column(df: pd.DataFrame) -> str:
     """
-    優先順位で R-BANK9 の列を決定。無ければ最後の列を使う。
+    優先順位で R-BANK9 列を決定。無ければ最後の列を使う。
     """
     cand_names = {
         "rbank9", "r_bank9", "rbnk9", "rbank_9", "r_bank_9", "r-bank9",
@@ -75,12 +86,13 @@ def _pick_index_column(df: pd.DataFrame) -> str:
     for c in df.columns:
         if c.strip().lower() in cand_names:
             return c
+    # fallback: last column
     return df.columns[-1]
 
 def _load_df() -> pd.DataFrame:
     """
     intraday があれば intraday 優先、無ければ history。
-    先頭列を DatetimeIndex にして NA を落とす。
+    先頭列を DatetimeIndex にして NA を落とし、数値列に強制変換。
     """
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
@@ -88,7 +100,6 @@ def _load_df() -> pd.DataFrame:
         df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
     else:
         raise FileNotFoundError("R-BANK9: neither intraday nor history csv found.")
-    df = df.dropna(how="all")
     for c in list(df.columns):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(how="all")
@@ -101,38 +112,36 @@ def gen_pngs() -> None:
     df = _load_df()
     col = _pick_index_column(df)
 
-    # 可視化用データ分割
+    # 可視化用に一定量確保
     tail_1d = df.tail(1000)
     tail_7d = df.tail(7 * 1000)
 
     _save(tail_1d, col, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d)")
     _save(tail_7d, col, OUTDIR / f"{INDEX_KEY}_7d.png", f"{INDEX_KEY.upper()} (7d)")
-    _save(df.tail(30 * 1000), col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
-    _save(df.tail(365 * 1000), col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
+    _save(df,      col, OUTDIR / f"{INDEX_KEY}_1m.png", f"{INDEX_KEY.upper()} (1m)")
+    _save(df,      col, OUTDIR / f"{INDEX_KEY}_1y.png", f"{INDEX_KEY.upper()} (1y)")
 
 # ------------------------
-# stats (level→pct) + marker writers
+# stats (pct) + marker writers
 # ------------------------
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def write_stats_and_marker() -> None:
     """
-    R-BANK9はintradayが指数レベル（例: 1.20, 1.25...）
-    → 当日最初と最後の比から騰落率(%)を算出。
-    サイト側は scale="pct" で読む。
+    仕様:
+      - intraday の R-BANK9 列は “百分率[%]” を直接保持（例: -0.93 は -0.93%）
+      - サイト側も pct として読む（scale="pct"）
+      - post_intraday.txt には "+/-xx.xx%" を出力
     """
     df = _load_df()
     col = _pick_index_column(df)
-    if len(df.index) < 2:
-        pct = None
-    else:
-        day = df.last('1D')
-        if len(day) < 2:
-            day = df
-        first = float(day[col].iloc[0])
-        last = float(day[col].iloc[-1])
-        pct = (last / first - 1.0) * 100.0
+
+    pct = None
+    if len(df.index) > 0:
+        last = df[col].iloc[-1]
+        if pd.notna(last):
+            pct = float(last)  # すでに百分率[%]想定
 
     payload = {
         "index_key": INDEX_KEY,
@@ -144,7 +153,6 @@ def write_stats_and_marker() -> None:
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
-    # human-readable marker
     marker = OUTDIR / f"{INDEX_KEY}_post_intraday.txt"
     if pct is None:
         marker.write_text(f"{INDEX_KEY.upper()} 1d: N/A\n", encoding="utf-8")
