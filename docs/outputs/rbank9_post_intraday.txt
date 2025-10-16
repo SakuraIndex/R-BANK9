@@ -1,1 +1,1 @@
-RBANK9 1d: -19.52% (basis first-row invalid→used first valid)
+RBANK9 1d: N/A (basis invalid→N/A)
