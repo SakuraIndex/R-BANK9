@@ -1,1 +1,1 @@
-RBANK9 1d: +inf%
+RBANK9 1d: N/A
