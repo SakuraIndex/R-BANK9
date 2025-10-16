@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-R-BANK9 charts + stats (完全版)
- - 1d = セッション内％推移（始値基準）
- - 7d / 1m / 1y = ウィンドウ先頭基準％推移
- - タイムゾーン安全 (naive/UTC/JST/tz-aware すべて対応)
- - エラー耐性: データ不足時は水平線＆pct_1d=None
- - ダークテーマ、線色は上昇=緑、下落=赤
+R-BANK9 charts + stats
+ - intraday CSV はレベル値（例 1.23, 1.45 ...）
+ - 1d の騰落率は「当日セッション（JST 09:00-15:30）の始値→終値」の比で算出
+ - 1d グラフは当日セッション内の％推移を描画（色は自動切替）
 """
 
 from pathlib import Path
-import os
 import json
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
+# ─────────────────────────────────────────────────────────────
+# 基本設定
+# ─────────────────────────────────────────────────────────────
+INDEX_KEY   = "rbank9"
+MARKET_TZ   = ZoneInfo("Asia/Tokyo")
+SESSION_S   = time(9, 0)    # 09:00
+SESSION_E   = time(15, 30)  # 15:30
 
-# =========================
-# 設定
-# =========================
-INDEX_KEY = "rbank9"
 OUTDIR = Path("docs/outputs")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_CSV  = OUTDIR / f"{INDEX_KEY}_history.csv"
 INTRADAY_CSV = OUTDIR / f"{INDEX_KEY}_intraday.csv"
 
-MARKET_TZ     = os.environ.get("MARKET_TZ", "Asia/Tokyo")
-SESSION_START = os.environ.get("SESSION_START", "09:00")
-SESSION_END   = os.environ.get("SESSION_END", "15:30")
-
-
-# =========================
-# グラフスタイル
-# =========================
+# ─────────────────────────────────────────────────────────────
+# ダークテーマ
+# ─────────────────────────────────────────────────────────────
 DARK_BG = "#0e0f13"
 DARK_AX = "#0b0c10"
 FG_TEXT = "#e7ecf1"
@@ -43,8 +39,7 @@ GRID    = "#2a2e3a"
 GREEN   = "#28e07c"
 RED     = "#ff4d4d"
 
-
-def _apply(ax, title: str, y_label: str) -> None:
+def _style(ax, title: str):
     fig = ax.figure
     fig.set_size_inches(12, 7)
     fig.set_dpi(160)
@@ -57,163 +52,144 @@ def _apply(ax, title: str, y_label: str) -> None:
     ax.yaxis.get_major_formatter().set_scientific(False)
     ax.set_title(title, color=FG_TEXT, fontsize=12)
     ax.set_xlabel("Time", color=FG_TEXT, fontsize=10)
-    ax.set_ylabel(y_label, color=FG_TEXT, fontsize=10)
+    ax.set_ylabel("Change (%)", color=FG_TEXT, fontsize=10)
 
-
-def _save_line(x, y, out_png: Path, title: str, y_label: str) -> None:
-    if len(y) >= 2 and np.isfinite(y.iloc[0]) and np.isfinite(y.iloc[-1]):
-        color = GREEN if y.iloc[-1] >= y.iloc[0] else RED
-    else:
-        color = FG_TEXT
-
-    fig, ax = plt.subplots()
-    _apply(ax, title, y_label)
-    ax.plot(x, y, color=color, linewidth=1.6)
-    fig.savefig(out_png, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-
-
-# =========================
-# 読み込み / タイムゾーン処理
-# =========================
-def _load_df() -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────
+# 入出力
+# ─────────────────────────────────────────────────────────────
+def _load_latest_df() -> pd.DataFrame:
+    """ intraday → history の優先で読み込み。index は DatetimeIndex """
     if INTRADAY_CSV.exists():
         df = pd.read_csv(INTRADAY_CSV, parse_dates=[0], index_col=0)
     elif HISTORY_CSV.exists():
         df = pd.read_csv(HISTORY_CSV, parse_dates=[0], index_col=0)
     else:
-        raise FileNotFoundError("No data CSV found.")
-
-    for c in df.columns:
+        raise FileNotFoundError("No intraday/history csv for R-BANK9.")
+    # 数値化
+    for c in list(df.columns):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(how="all")
-    return _to_jst(df)
-
-
-def _detect_tz_for_naive(df: pd.DataFrame) -> str:
-    """naive index が UTC か JST かを簡易判定（大半が9〜15時ならJST）"""
-    h = df.index.hour
-    return "JST" if ((h >= 9) & (h <= 15)).mean() > 0.5 else "UTC"
-
-
-def _to_jst(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    idx = df.index
-    if idx.tz is None:
-        tztype = _detect_tz_for_naive(df)
-        if tztype == "UTC":
-            idx = idx.tz_localize("UTC").tz_convert(MARKET_TZ)
-        else:
-            idx = idx.tz_localize(MARKET_TZ)
+    # UTC/TZ 付与（既に tz-aware の場合は変換だけ）
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(timezone.utc)
     else:
-        idx = idx.tz_convert(MARKET_TZ)
-
-    df = df.copy()
-    df.index = idx
-    return df
-
-
-def _pick_index_column(df: pd.DataFrame) -> str:
-    cand = {
-        "rbank9", "r_bank9", "rbnk9", "rbank_9", "r_bank_9", "r-bank9",
-        INDEX_KEY, INDEX_KEY.upper(), "R_BANK9", "RBANK9"
-    }
+        df.index = df.index.tz_convert(timezone.utc)
+    # 列名の候補
+    cand = {"rbank9", "r_bank9", "rbnk9", "rbank_9", "r_bank_9", "r-bank9", INDEX_KEY, INDEX_KEY.upper(), "R_BANK9", "RBANK9"}
+    col = None
     for c in df.columns:
         if c.strip().lower() in cand:
-            return c
-    return df.columns[-1]
+            col = c; break
+    if col is None:
+        col = df.columns[-1]
+    return df.sort_index(), col
 
-
-# =========================
-# 抽出＆％変換
-# =========================
-def _today_session_window():
-    tz = pd.Timestamp.now(tz=MARKET_TZ).tz
-    now = pd.Timestamp.now(tz)
-    sh, sm = map(int, SESSION_START.split(":"))
-    eh, em = map(int, SESSION_END.split(":"))
-    start = pd.Timestamp(year=now.year, month=now.month, day=now.day, hour=sh, minute=sm, tz=tz)
-    end = pd.Timestamp(year=now.year, month=now.month, day=now.day, hour=eh, minute=em, tz=tz)
+def _today_session_window(now_tz: datetime) -> tuple[datetime, datetime]:
+    """ ローカル日付の 09:00–15:30 の区間（tz-aware, MARKET_TZ）を返す """
+    d = now_tz.date()
+    start = datetime.combine(d, SESSION_S, tzinfo=MARKET_TZ)
+    end   = datetime.combine(d, SESSION_E, tzinfo=MARKET_TZ)
     if end <= start:
-        end = end + pd.Timedelta(days=1)
-    return start.to_pydatetime(), end.to_pydatetime()
+        end += timedelta(days=1)
+    return start, end
 
+def _slice_today_session(df_utc: pd.DataFrame) -> pd.DataFrame:
+    """ UTC index → MARKET_TZ へ変換後、当日セッションで切り出し """
+    df_local = df_utc.copy()
+    df_local.index = df_local.index.tz_convert(MARKET_TZ)
+    now_local = datetime.now(MARKET_TZ)
+    s, e = _today_session_window(now_local)
+    return df_local[(df_local.index >= s) & (df_local.index <= e)]
 
-def _slice(df: pd.DataFrame, start, end) -> pd.DataFrame:
-    return df[(df.index >= start) & (df.index <= end)]
+# ─────────────────────────────────────────────────────────────
+# 1d グラフと騰落率
+# ─────────────────────────────────────────────────────────────
+def _plot_1d_pct(df_local: pd.DataFrame, col: str, outpath: Path):
+    """ 当日セッション内の％推移を描画。色は始値/終値で自動切替 """
+    # 有効値だけ
+    ser = df_local[col].dropna()
+    fig, ax = plt.subplots()
+    _style(ax, f"{INDEX_KEY.upper()} (1d %)")
 
+    if len(ser) < 2:
+        # データが足りないときは 0% の水平線を描く
+        ax.plot(df_local.index, [0.0] * len(df_local.index), color=FG_TEXT, linewidth=1.5)
+        fig.savefig(outpath, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return None  # pct_1d は別で計算する
 
-def _to_pct_series(series: pd.Series, base: float) -> pd.Series:
-    if not np.isfinite(base) or base == 0:
-        return pd.Series(dtype=float, index=series.index)
-    return (series / base - 1.0) * 100.0
-
-
-# =========================
-# 生成メイン
-# =========================
-def gen_pngs_and_stats() -> None:
-    df = _load_df()
-    col = _pick_index_column(df)
-
-    # ---- 1d ----
-    s, e = _today_session_window()
-    day = _slice(df, s, e)
-    day = day[[col]].dropna()
-
-    if len(day) >= 2:
-        base = float(day[col].iloc[0])
-        pct1d = _to_pct_series(day[col], base)
-        _save_line(pct1d.index, pct1d, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d %)", "Change (%)")
-        last_pct = float(pct1d.iloc[-1])
+    first = ser.iloc[0]
+    last  = ser.iloc[-1]
+    if first == 0 or pd.isna(first) or pd.isna(last):
+        color = FG_TEXT
+        pct_series = pd.Series([0.0]*len(ser), index=ser.index)
+        pct_val = None
     else:
-        zero = pd.Series([0.0, 0.0],
-                         index=pd.DatetimeIndex([
-                             pd.Timestamp.now(tz=MARKET_TZ) - pd.Timedelta(hours=1),
-                             pd.Timestamp.now(tz=MARKET_TZ)
-                         ]))
-        _save_line(zero.index, zero, OUTDIR / f"{INDEX_KEY}_1d.png", f"{INDEX_KEY.upper()} (1d %)", "Change (%)")
-        last_pct = None
+        pct_series = (ser / first - 1.0) * 100.0
+        pct_val = (last / first - 1.0) * 100.0
+        color = GREEN if pct_val >= 0 else RED
 
-    # ---- 7d / 1m / 1y ----
-    def _window_pct(days: int, title: str, out: Path):
-        w = df[[col]].last(f"{days}D").dropna()
-        if len(w) >= 2:
-            base = float(w[col].iloc[0])
-            pct = _to_pct_series(w[col], base)
-            _save_line(pct.index, pct, out, f"{INDEX_KEY.upper()} ({title} %)", "Change (%)")
-        else:
-            zero = pd.Series([0.0, 0.0],
-                             index=pd.DatetimeIndex([
-                                 pd.Timestamp.now(tz=MARKET_TZ) - pd.Timedelta(days=days - 1),
-                                 pd.Timestamp.now(tz=MARKET_TZ)
-                             ]))
-            _save_line(zero.index, zero, out, f"{INDEX_KEY.upper()} ({title} %)", "Change (%)")
+    ax.plot(pct_series.index, pct_series.values, color=color, linewidth=1.6)
+    fig.savefig(outpath, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return pct_val
 
-    _window_pct(7, "7d", OUTDIR / f"{INDEX_KEY}_7d.png")
-    _window_pct(30, "1m", OUTDIR / f"{INDEX_KEY}_1m.png")
-    _window_pct(365, "1y", OUTDIR / f"{INDEX_KEY}_1y.png")
-
-    # ---- stats & post file ----
+def _write_stats_and_marker(pct_1d):
     payload = {
         "index_key": INDEX_KEY,
-        "pct_1d": None if last_pct is None or not np.isfinite(last_pct) else round(float(last_pct), 6),
+        "pct_1d": None if pct_1d is None else float(round(pct_1d, 6)),
         "scale": "pct",
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    (OUTDIR / f"{INDEX_KEY}_stats.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = f"{INDEX_KEY.upper()} 1d: " + ("N/A" if pct_1d is None else f"{pct_1d:+.2f}%") + "\n"
+    (OUTDIR / f"{INDEX_KEY}_post_intraday.txt").write_text(txt, encoding="utf-8")
 
-    marker = OUTDIR / f"{INDEX_KEY}_post_intraday.txt"
-    if payload["pct_1d"] is None:
-        marker.write_text(f"{INDEX_KEY.upper()} 1d: N/A\n", encoding="utf-8")
-    else:
-        marker.write_text(f"{INDEX_KEY.upper()} 1d: {payload['pct_1d']:+.2f}%\n", encoding="utf-8")
+# 参考：7d/1m/1y は見た目の互換性維持のため「レベル値の折れ線」のまま出力
+def _simple_level_plot(df_utc: pd.DataFrame, col: str, tail_points: int, title: str, outpath: Path):
+    df = df_utc.tail(tail_points).copy()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(timezone.utc)
+    df.index = df.index.tz_convert(MARKET_TZ)
+    ser = df[col]
+    color = FG_TEXT
+    if len(ser.dropna()) >= 2:
+        first, last = ser.dropna().iloc[0], ser.dropna().iloc[-1]
+        if pd.notna(first) and pd.notna(last):
+            color = GREEN if last >= first else RED
 
+    fig, ax = plt.subplots()
+    # ラベルは「Index / Value」のかわりに実態を示す
+    ax.set_ylabel("Index level", color=FG_TEXT, fontsize=10)
+    _style(ax, title)
+    ax.plot(df.index, ser, color=color, linewidth=1.2)
+    fig.savefig(outpath, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # main
-# =========================
+# ─────────────────────────────────────────────────────────────
+def main():
+    df_utc, col = _load_latest_df()
+
+    # 当日セッションを JST で切り出し
+    today_local = _slice_today_session(df_utc)
+
+    # 1D（％）を描画 & 当日 pct を計算
+    pct_1d = _plot_1d_pct(
+        df_local=today_local,
+        col=col,
+        outpath=OUTDIR / f"{INDEX_KEY}_1d.png",
+    )
+
+    # 7d/1m/1y は従来どおりレベル値の推移（見た目だけ色切替）
+    _simple_level_plot(df_utc, col, tail_points=7*24*12,  title=f"{INDEX_KEY.upper()} (7d)", outpath=OUTDIR / f"{INDEX_KEY}_7d.png")
+    _simple_level_plot(df_utc, col, tail_points=30*24*12, title=f"{INDEX_KEY.upper()} (1m)", outpath=OUTDIR / f"{INDEX_KEY}_1m.png")
+    _simple_level_plot(df_utc, col, tail_points=365*24*12,title=f"{INDEX_KEY.upper()} (1y)", outpath=OUTDIR / f"{INDEX_KEY}_1y.png")
+
+    # 統計とマーカーを常に書き直す
+    _write_stats_and_marker(pct_1d)
+
 if __name__ == "__main__":
-    gen_pngs_and_stats()
+    main()
