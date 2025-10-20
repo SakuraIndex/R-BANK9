@@ -1,10 +1,6 @@
-name: R-BANK9 • intraday snapshot (JST 11:35 & 15:35)
+name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
-  schedule:
-    # JST 11:35 / 15:35 → UTC 02:35 / 06:35
-    - cron: "35 2 * * 1-5"
-    - cron: "35 6 * * 1-5"
   workflow_dispatch:
     inputs:
       session_start:
@@ -20,9 +16,14 @@ on:
         required: true
         default: "09:00"
       basis:
-        description: "Return basis label (open@09:00 / prev_close)"
+        description: "Return basis label"
         required: true
         default: "prev_close"
+
+  schedule:
+    # JST 11:35, 15:35 → UTC 02:35, 06:35（平日）
+    - cron: "35 2 * * 1-5"
+    - cron: "35 6 * * 1-5"
 
 permissions:
   contents: write
@@ -41,7 +42,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -57,13 +57,10 @@ jobs:
         run: |
           test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 2)
           test -f docs/outputs/rbank9_intraday.csv || (echo "Missing docs/outputs/rbank9_intraday.csv" && exit 2)
-          [[ "${{ inputs.session_start || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
-          [[ "${{ inputs.session_end   || '15:30' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
-          [[ "${{ inputs.day_anchor    || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
 
       - name: Generate intraday post and snapshot
         env:
-          INDEX_KEY: rbank9
+          INDEX_KEY: RBANK9                    # ★ CSVの列名と一致させる（必要に応じて変更）
           CSV: docs/outputs/rbank9_intraday.csv
           OUT_JSON: docs/outputs/rbank9_stats.json
           OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
@@ -72,15 +69,12 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          VALUE_TYPE:    ratio                    # ★ 前日終値比
+          DT_COL:        Datetime
+          LABEL:         R-BANK9
         run: |
           set -euo pipefail
           echo "=== intraday snapshot (R-BANK9) ==="
-          echo "INDEX_KEY=${INDEX_KEY}"
-          echo "SESSION_START=${SESSION_START}"
-          echo "SESSION_END=${SESSION_END}"
-          echo "DAY_ANCHOR=${DAY_ANCHOR}"
-          echo "BASIS=${BASIS}"
-
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -91,7 +85,9 @@ jobs:
             --session-end "${SESSION_END}" \
             --day-anchor "${DAY_ANCHOR}" \
             --basis "${BASIS}" \
-            --value-type percent
+            --label "${LABEL}" \
+            --dt-col "${DT_COL}" \
+            --value-type "${VALUE_TYPE}"
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -106,10 +102,12 @@ jobs:
           retention-days: 3
 
       - name: Commit outputs if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          git config --global user.name  "github-actions"
-          git config --global user.email "github-actions@github.com"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/outputs/rbank9_intraday.png \
                   docs/outputs/rbank9_post_intraday.txt \
                   docs/outputs/rbank9_stats.json || true
