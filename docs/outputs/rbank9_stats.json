@@ -1,1 +1,12 @@
-{"index_key": "rbank9", "pct_1d": 5.555555555555443, "delta_level": 0.07170172084129933, "scale": "percent", "basis": "open@09:00", "session": "09:00–15:30 JST", "updated_at": "2025-10-20T13:37:54+09:00"}
+{
+  "index_key": "R_BANK9",
+  "label": "R-BANK9",
+  "pct_intraday": 168.71203252960046,
+  "basis": "prev_close",
+  "session": {
+    "start": "09:00",
+    "end": "15:30",
+    "anchor": "09:00"
+  },
+  "updated_at": "2025-10-20T22:46:25.927958+09:00"
+}
