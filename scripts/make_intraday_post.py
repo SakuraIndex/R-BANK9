@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Intraday CSV を読み、当日 09:00–15:30(JST) のセッションに基づく 1d 騰落率と
+Intraday CSV を読み、当日 09:00–15:30(JST) セッションに基づく 1d 騰落率と
 テキスト/JSON 出力を作成するユーティリティ。
 
 使い方（例）:
@@ -38,6 +38,26 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _to_jst(series: pd.Series) -> pd.Series:
+    """
+    文字列/数値の時刻列を JST の tz-aware Timestamp に変換するヘルパー。
+    - tz 情報なし（naive）のとき: JST に localize
+    - tz 情報あり（UTC 等）のとき: JST に convert
+    """
+    ts = pd.to_datetime(series, errors="coerce")
+    # 全部 naive（tz なし）の場合
+    if getattr(ts.dt, "tz", None) is None:
+        # pandas では tz_localize に errors 引数はないので使わない
+        try:
+            ts = ts.dt.tz_localize(JST, nonexistent="shift_forward", ambiguous="NaT")
+        except Exception:
+            # フォールバック（古い pandas でも動くように）
+            ts = ts.dt.tz_localize(JST)
+    else:
+        ts = ts.dt.tz_convert(JST)
+    return ts
+
+
 def load_intraday(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     if df.shape[1] < 2:
@@ -45,12 +65,8 @@ def load_intraday(csv_path: Path) -> pd.DataFrame:
     ts_col, val_col = df.columns[:2]
     df = df.rename(columns={ts_col: "ts", val_col: "val"}).copy()
 
-    # できるだけ JST として解釈（tz 無しなら JST を付与）
-    ts = pd.to_datetime(df["ts"], errors="coerce", utc=False)
-    # pandas Timestamp に tz がない場合は JST を付与
-    ts = ts.dt.tz_localize(JST, nonexistent="shift_forward", ambiguous="NaT", errors="coerce") \
-         .fillna(pd.to_datetime(df["ts"], errors="coerce", utc=True))  # 念のためのフォールバック
-    df["ts"] = ts
+    # まず JST として正規化
+    df["ts"] = _to_jst(df["ts"])
     df = df.dropna(subset=["ts", "val"]).sort_values("ts").reset_index(drop=True)
     return df
 
@@ -58,22 +74,20 @@ def load_intraday(csv_path: Path) -> pd.DataFrame:
 def session_filter(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    d = df["ts"].dt.tz_convert(JST)
+    d = df["ts"]  # すでに JST
     mask = (d.dt.time >= SESSION_START) & (d.dt.time <= SESSION_END)
     sdf = df.loc[mask].copy()
     # 当日で絞る（最後の行の日付を採用）
     if not sdf.empty:
-        last_day = sdf["ts"].dt.tz_convert(JST).dt.normalize().iloc[-1]
-        sdf = sdf[sdf["ts"].dt.tz_convert(JST).dt.normalize() == last_day].copy()
+        last_day = sdf["ts"].dt.normalize().iloc[-1]
+        sdf = sdf[sdf["ts"].dt.normalize() == last_day].copy()
     return sdf
 
 
 def pick_open_at_9(df: pd.DataFrame) -> float | None:
     if df.empty:
         return None
-    # 09:00 以降の最初の値（なければ全体の最初）
-    jst = df["ts"].dt.tz_convert(JST)
-    after_open = df[jst.dt.time >= SESSION_START]
+    after_open = df[df["ts"].dt.time >= SESSION_START]
     if not after_open.empty:
         return float(after_open.iloc[0]["val"])
     return float(df.iloc[0]["val"])
@@ -94,7 +108,6 @@ def main():
     df_sess = session_filter(df)
 
     if df_sess.empty:
-        # セッションが該当しない場合は null / N/A を出力
         payload = {
             "index_key": args.index_key,
             "pct_1d": None,
@@ -117,8 +130,8 @@ def main():
     pct = calc_pct(base, close)
     delta = close - base
 
-    start_ts = df_sess.iloc[0]["ts"].astimezone(JST)
-    end_ts = df_sess.iloc[-1]["ts"].astimezone(JST)
+    start_ts = df_sess.iloc[0]["ts"]
+    end_ts = df_sess.iloc[-1]["ts"]
 
     payload = {
         "index_key": args.index_key,
