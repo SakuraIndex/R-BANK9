@@ -1,10 +1,7 @@
-name: R-BANK9 • long charts & intraday percent (JST 09:00–15:00)
+name: R-BANK9 • long charts & intraday percent (JST 09:00–15:30)
 
 on:
   workflow_dispatch:
-  schedule:
-    # 平日 09:00–15:00 JST（= 00:00–06:00 UTC）に10分おき
-    - cron: "*/10 0-6 * * 1-5"
 
 permissions:
   contents: write
@@ -16,13 +13,10 @@ concurrency:
 env:
   INDEX_KEY: rbank9
   OUT_DIR: docs/outputs
-  # セッション・タイムゾーン
-  TRADING_START: "09:00"
-  TRADING_END: "15:00"
-  INTRADAY_TZ: "UTC"         # 取得CSVがUTCなら "UTC"（+9hシフト）。既にJSTなら "JST"
-  TZ_OFFSET_HOURS: "9"       # INTRADAY_TZ=UTC のとき +9
-  # ← ここが新規（level が％ポイントなので相対％ではなく差分％を採用）
-  PCT_MODE: "delta"          # "delta": pct = (last - base) in percentage points, "relative": (last-base)/|base|*100
+  # 表示用のセッション表記（スクリプト側で使わなくても可）
+  SESSION_START: "09:00"
+  SESSION_END: "15:30"
+  TIMEZONE: "Asia/Tokyo"
 
 jobs:
   build:
@@ -52,141 +46,38 @@ jobs:
           print("Matplotlib:", getattr(matplotlib, "__version__", "n/a"))
           PY
 
-      # ───────── 長期チャート生成 ─────────
+      # ───────── チャート生成（1d/7d/1m/1y） ─────────
       - name: Ensure plotting script exists
         run: |
-          set -euxo pipefail
           test -f scripts/long_charts.py || (echo "scripts/long_charts.py NOT FOUND" && exit 2)
 
-      - name: Generate long-term charts (1d/7d/1m/1y)
+      - name: Generate long-term charts
         run: |
           set -euxo pipefail
           python scripts/long_charts.py
+          echo "=== MARKER: long_charts finished ==="
 
-      # ───────── 1d 騰落率（JSTセッション優先 / フォールバックあり） ─────────
-      - name: Compute 1d percent & posts (session 09:00–15:00 JST)
+      - name: Check outputs after plotting
         run: |
           set -euxo pipefail
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          import pandas as pd
+          ls -la ${OUT_DIR} || true
+          git status --porcelain || true
 
-          INDEX_KEY   = os.environ.get("INDEX_KEY", "rbank9")
-          OUT_DIR     = Path(os.environ.get("OUT_DIR", "docs/outputs"))
-          START       = os.environ.get("TRADING_START", "09:00")
-          END         = os.environ.get("TRADING_END",   "15:00")
-          IN_TZ       = os.environ.get("INTRADAY_TZ", "UTC").upper()
-          SHIFT       = int(os.environ.get("TZ_OFFSET_HOURS", "9"))
-          PCT_MODE    = os.environ.get("PCT_MODE", "delta").lower()
-
-          EPS = 5.0         # 安定点探索用の下限（levelは％ポイントなので大きめでOK）
-          CLAMP = 30.0      # 表示の安全クランプ（±30%）
-
-          def iso_now():
-              return pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00","Z")
-
-          def session_mask(ts: pd.Series) -> pd.Series:
-              sh, sm = map(int, START.split(":"))
-              eh, em = map(int, END.split(":"))
-              after_open   = (ts.dt.hour > sh) | ((ts.dt.hour == sh) & (ts.dt.minute >= sm))
-              before_close = (ts.dt.hour < eh) | ((ts.dt.hour == eh) & (ts.dt.minute <= em))
-              return after_open & before_close
-
-          def clamp(x):
-              if x is None: return None
-              if x >  CLAMP: return CLAMP
-              if x < -CLAMP: return -CLAMP
-              return x
-
-          def relative_percent(first, last):
-              # 相対％： (last-first)/max(|first|,EPS')*100
-              try:
-                  denom = max(abs(float(first)), 1.0)  # 1.0(=1%) を下限に
-                  return (float(last) - float(first)) / denom * 100.0
-              except Exception:
-                  return None
-
-          def write(text, pct, delta, basis):
-              OUT_DIR.mkdir(parents=True, exist_ok=True)
-              (OUT_DIR / f"{INDEX_KEY}_post_intraday.txt").write_text(text, encoding="utf-8")
-              payload = {
-                  "index_key": INDEX_KEY,
-                  "pct_1d": None if pct is None else float(pct),
-                  "delta_level": None if delta is None else float(delta),
-                  "scale": "percent",
-                  "basis": basis,
-                  "updated_at": iso_now(),
-              }
-              (OUT_DIR / f"{INDEX_KEY}_stats.json").write_text(
-                  json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-              )
-
-          # 1) intraday.csv（JST 09:00–15:00）
-          intraday = OUT_DIR / f"{INDEX_KEY}_intraday.csv"
-          if intraday.exists():
-              df = pd.read_csv(intraday)
-              if df.shape[1] >= 2:
-                  ts_col, val_col = df.columns[:2]
-                  df = df.rename(columns={ts_col:"ts", val_col:"val"})
-                  df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
-                  df = df.dropna(subset=["ts","val"]).sort_values("ts").reset_index(drop=True)
-                  if IN_TZ == "UTC":
-                      df["ts"] = df["ts"] + pd.Timedelta(hours=SHIFT)
-                  if not df.empty:
-                      the_day = df["ts"].dt.floor("D").iloc[-1]
-                      d = df[df["ts"].dt.floor("D") == the_day].copy()
-                      d_sess = d.loc[session_mask(d["ts"])].copy()
-                      if not d_sess.empty:
-                          base = float(d_sess.iloc[0]["val"])  # 09:00 open
-                          last_val = float(d_sess.iloc[-1]["val"])
-                          delta = last_val - base
-                          # ---- ここがポイント：delta/relative 切替 ----
-                          if PCT_MODE == "delta":
-                              pct = clamp(delta)                 # ％ポイント差をそのまま％として扱う
-                              basis = "open@09:00"
-                          else:
-                              pct = clamp(relative_percent(base, last_val))
-                              basis = "open@09:00(rel)"
-                          first_ts, last_ts = d_sess.iloc[0]["ts"], d_sess.iloc[-1]["ts"]
-                          pct_str = "N/A" if pct is None else f"{pct:+.2f}%"
-                          txt = f"{INDEX_KEY.upper()} 1d: Δ={delta:+.6f} (level) A%={pct_str} (basis={basis} sess={START}-{END} valid={first_ts}->{last_ts})\n"
-                          write(txt, pct, delta, basis)
-                          raise SystemExit(0)
-
-          # 2) fallback: 1d.csv（安定基準）
-          one = OUT_DIR / f"{INDEX_KEY}_1d.csv"
-          if one.exists():
-              df = pd.read_csv(one)
-              if df.shape[1] >= 2:
-                  ts_col, val_col = df.columns[:2]
-                  df = df.rename(columns={ts_col:"ts", val_col:"val"})
-                  df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
-                  df = df.dropna(subset=["ts","val"]).sort_values("ts").reset_index(drop=True)
-                  if not df.empty:
-                      day = df["ts"].dt.floor("D").iloc[-1]
-                      dd = df[df["ts"].dt.floor("D")==day].copy()
-                      mask = (dd["ts"].dt.hour > 10) | ((dd["ts"].dt.hour == 10) & (dd["ts"].dt.minute >= 0))
-                      cand = dd.loc[mask & (dd["val"].abs() >= EPS)]
-                      if not cand.empty:
-                          base = float(cand.iloc[0]["val"]); basis0 = "stable@10:00"
-                      else:
-                          base = float(dd.iloc[0]["val"]);  basis0 = "open"
-                      last_val = float(dd.iloc[-1]["val"])
-                      delta = last_val - base
-                      if PCT_MODE == "delta":
-                          pct = clamp(delta); basis = basis0
-                      else:
-                          pct = clamp(relative_percent(base, last_val)); basis = basis0+"(rel)"
-                      first_ts, last_ts = dd.iloc[0]["ts"], dd.iloc[-1]["ts"]
-                      pct_str = "N/A" if pct is None else f"{pct:+.2f}%"
-                      txt = f"{INDEX_KEY.upper()} 1d: Δ={delta:+.6f} (level) A%={pct_str} (basis={basis} valid={first_ts}->{last_ts})\n"
-                      write(txt, pct, delta, basis)
-                      raise SystemExit(0)
-
-          # 3) no data
-          write(f"{INDEX_KEY.upper()} 1d: Δ=N/A (level) A%=N/A (basis=no_data)\n", None, None, "no_data")
-          PY
+      # ───────── 1d 騰落率（寄り or 安定点/自動） ─────────
+      # 既存の intraday CSV があるときだけ上書き（なければスキップ）
+      - name: Override with intraday.csv (session-based)
+        run: |
+          set -euxo pipefail
+          if [ -f "${OUT_DIR}/${INDEX_KEY}_intraday.csv" ]; then
+            echo "=== intraday override ==="
+            python scripts/make_intraday_post.py \
+              --index-key "${INDEX_KEY}" \
+              --csv "${OUT_DIR}/${INDEX_KEY}_intraday.csv" \
+              --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
+              --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt"
+          else
+            echo "No intraday.csv; keep previous stats."
+          fi
 
       - name: Upload artifacts (for debug)
         if: always()
@@ -199,14 +90,14 @@ jobs:
             docs/outputs/*post*.txt
             docs/outputs/*stats*.json
 
-      - name: Commit outputs if changed
+      - name: Commit charts if changed
         run: |
           set -euxo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A docs/outputs
           if ! git diff --cached --quiet; then
-            git commit -m "chore(charts): update ${INDEX_KEY} (1d/7d/1m/1y + stats + intraday)"
+            git commit -m "chore(charts): update ${INDEX_KEY} (1d/7d/1m/1y + stats + intraday, JST 09:00–15:30)"
             git push
           else
             echo "No changes to commit."
