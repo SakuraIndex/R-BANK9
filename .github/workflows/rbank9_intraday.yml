@@ -1,6 +1,7 @@
 name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
+  # 手動実行（Run workflow ボタン）
   workflow_dispatch:
     inputs:
       session_start:
@@ -23,6 +24,15 @@ on:
         description: "Value type: ratio | percent"
         required: true
         default: "ratio"
+      dt_col:
+        description: "Datetime column name (use 'auto' to auto-detect)"
+        required: true
+        default: "auto"
+
+  # 自動実行（JST 11:35 / 15:35）※UTC 02:35 / 06:35
+  schedule:
+    - cron: "35 2 * * 1-5"
+    - cron: "35 6 * * 1-5"
 
 permissions:
   contents: write
@@ -73,12 +83,22 @@ jobs:
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
           VALUE_TYPE:    ${{ inputs.value_type    || 'ratio' }}
-          DT_COL:        Unnamed: 0
+          # R-BANK9 の intraday CSV は 1列目が Datetime 相当（列名が 'Unnamed: 0'）なので既定をそれに
+          # 入力で 'auto' 指定ならスクリプト側の自動検出に任せる
+          DT_COL_IN:     ${{ inputs.dt_col || 'auto' }}
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
-          echo "=== intraday snapshot (R–BANK9) ==="
+          echo "=== intraday snapshot (R-BANK9) ==="
           echo "CSV=${CSV}"
+
+          # YAML/シェルでコロンを含む列名を安全に渡すため、ここで最終決定＆引用
+          if [ "${DT_COL_IN}" = "auto" ]; then
+            DT_COL="auto"
+          else
+            DT_COL="${DT_COL_IN}"
+          fi
+
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
