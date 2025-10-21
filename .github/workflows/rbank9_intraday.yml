@@ -1,7 +1,7 @@
 name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
-  # ← これがある限り Run workflow ボタンは表示されます
+  # ← 手動ディスパッチ（Run workflow ボタン用）
   workflow_dispatch:
     inputs:
       session_start:
@@ -21,13 +21,14 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "Value type: percent | ratio | decimal | auto"
+        description: "Value type: percent | ratio （percent推奨）"
         required: true
         default: "percent"
 
-  # 平日 11:35 / 15:35（JST）（= UTC 02:35 / 06:35）
+  # ← 自動スケジュール（JST 11:35 / 15:35）※平日
   schedule:
-    - cron: "35 2,6 * * 1-5"
+    - cron: "35 2 * * 1-5"   # 11:35 JST
+    - cron: "35 6 * * 1-5"   # 15:35 JST
 
 permissions:
   contents: write
@@ -52,7 +53,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -61,12 +61,15 @@ jobs:
 
       - name: Verify scripts & inputs exist
         run: |
-          set -euo pipefail
           test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 2)
           test -f docs/outputs/rbank9_intraday.csv || (echo "Missing docs/outputs/rbank9_intraday.csv" && exit 2)
-          [[ "${{ inputs.session_start || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
-          [[ "${{ inputs.session_end   || '15:30' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
-          [[ "${{ inputs.day_anchor    || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
+
+          # 入力バリデーション（手動時）
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [[ "${{ inputs.session_start }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
+            [[ "${{ inputs.session_end }}"   =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
+            [[ "${{ inputs.day_anchor }}"    =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
+          fi
 
       - name: Generate intraday post and snapshot
         env:
@@ -75,17 +78,19 @@ jobs:
           OUT_JSON: docs/outputs/rbank9_stats.json
           OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
           SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-          SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ inputs.value_type    || 'percent' }}
+          SESSION_START: ${{ github.event_name == 'workflow_dispatch' && inputs.session_start || '09:00' }}
+          SESSION_END:   ${{ github.event_name == 'workflow_dispatch' && inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ github.event_name == 'workflow_dispatch' && inputs.day_anchor    || '09:00' }}
+          BASIS:         ${{ github.event_name == 'workflow_dispatch' && inputs.basis         || 'prev_close' }}
+          VALUE_TYPE:    ${{ github.event_name == 'workflow_dispatch' && inputs.value_type    || 'percent' }}
           DT_COL:        Unnamed: 0
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
-          echo "=== Intraday snapshot (R-BANK9) ==="
+          echo "=== Intraday snapshot (R–BANK9) ==="
           echo "CSV file: ${CSV}"
+          echo "Datetime column: ${DT_COL}"
+
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
