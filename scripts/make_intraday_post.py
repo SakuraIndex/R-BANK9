@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-R-BANK9 intraday: make snapshot chart + post text + stats json
-
-更新点
-- --csv-unit {auto,percent,ratio} をサポート（既定: auto）
-  * percent: CSVの各列は「前日比[%]」値（例 0.36 = +0.36%）
-  * ratio  : CSVの各列は「前日比の小数倍率」（例 0.0036 = +0.36%）
-  * auto   : ヒューリスティックで自動判定（0.95分位の絶対値 < 0.5 を ratio とみなす）
-- タイムゾーン変換を安定化（naiveはUTCとみなしJSTへ）
-- セッションは「最新行のJST日付」を基準に 09:00–15:30 等で抽出
-- グラフはダーク背景、凡例（白枠）なし
-- pct_intraday は「%値」をそのまま JSON に出力（例: +0.36% → 0.36）
-"""
-
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,7 +29,7 @@ class Args:
     value_type: str
     dt_col: str
     label: str
-    csv_unit: str  # "auto" | "percent" | "ratio"
+    csv_unit: str  # auto | percent | ratio
 
 
 def parse_args() -> Args:
@@ -56,14 +43,14 @@ def parse_args() -> Args:
     p.add_argument("--session-end", default="15:30")
     p.add_argument("--day-anchor", default="09:00")
     p.add_argument("--basis", default="prev_close")
-    p.add_argument("--value-type", default="percent")  # 出力は%表記
-    p.add_argument("--dt-col", default="Unnamed: 0")
+    p.add_argument("--value-type", default="percent")
+    p.add_argument("--dt-col", default="Unnamed: 0")  # 指定が無くても自動検出する
     p.add_argument("--label", default="R-BANK9")
     p.add_argument(
         "--csv-unit",
         choices=["auto", "percent", "ratio"],
         default="auto",
-        help="CSV の値の単位（前日比[%] or 小数倍率）。auto はヒューリスティックで判定。",
+        help="CSV の値の単位（percent=％値、ratio=小数倍率）。auto は中身から判定。",
     )
     a = p.parse_args()
     return Args(
@@ -83,55 +70,91 @@ def parse_args() -> Args:
     )
 
 
-# ---------- utils ----------
+# -------------------- CSV 読み込み（ロバスト） --------------------
 
-def _read_csv_jst(csv_path: Path, dt_col: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, parse_dates=[dt_col], index_col=dt_col)
-    idx = df.index
-    if not isinstance(idx, pd.DatetimeIndex):
-        raise TypeError("Datetime index が取得できません。")
-    # naive は UTC とみなし JST へ
-    if idx.tz is None:
-        idx = idx.tz_localize("UTC").tz_convert(JST)
-    else:
-        idx = idx.tz_convert(JST)
+def _try_parse_dt_col(df: pd.DataFrame, col: str) -> Optional[pd.DatetimeIndex]:
+    if col in df.columns:
+        ts = pd.to_datetime(df[col], utc=True, errors="coerce")
+        if ts.notna().any():
+            # tz付きで返る（utc=True を指定）→ JST へ
+            return ts.dt.tz_convert(JST)
+    return None
+
+
+def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, str]:
+    # 1) 先頭列を優先
+    first = df.columns[0]
+    ts = pd.to_datetime(df[first], utc=True, errors="coerce")
+    if ts.notna().any():
+        return ts.dt.tz_convert(JST), first
+
+    # 2) 全列走査
+    for c in df.columns:
+        ts = pd.to_datetime(df[c], utc=True, errors="coerce")
+        if ts.notna().any():
+            return ts.dt.tz_convert(JST), c
+
+    raise TypeError(
+        "Datetime index が取得できません。CSV の先頭行/列をご確認ください。"
+    )
+
+
+def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
+    # 一旦素で読み込む（型は後で整える）
+    df = pd.read_csv(csv_path)
+
+    if df.empty:
+        raise ValueError("CSV が空です。")
+
+    # 指定列があれば優先して試す
+    idx: Optional[pd.DatetimeIndex] = None
+    used_col: Optional[str] = None
+    if prefer_col and prefer_col in df.columns:
+        idx = _try_parse_dt_col(df, prefer_col)
+        used_col = prefer_col if idx is not None else None
+
+    # 自動検出
+    if idx is None:
+        idx, used_col = _auto_find_datetime_index(df)
+
+    # インデックス化
     df.index = idx
+    if used_col in df.columns:
+        df = df.drop(columns=[used_col])
+
     # 数値化
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 並び替え・重複除去
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    print(f"[read_csv] columns={list(df.columns)}  rows={len(df)}  used_dt_col={used_col}")
     return df
 
+
+# -------------------- セッション抽出 & 指数化 --------------------
 
 def _session_slice(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
     if df_jst.empty:
         return df_jst
-    last_day = df_jst.index[-1].date()  # JST date
+    last_day = df_jst.index[-1].date()
     start = pd.Timestamp(f"{last_day} {start_hm}", tz=JST)
     end = pd.Timestamp(f"{last_day} {end_hm}", tz=JST)
     return df_jst.loc[(df_jst.index >= start) & (df_jst.index <= end)]
 
 
 def _detect_unit_is_ratio(df: pd.DataFrame) -> bool:
-    """
-    値域から ratio かどうかを推定。
-    0.95分位の絶対値が 0.5 未満の時は ratio とみなす（= 0.5% 未満が大勢）。
-    """
-    flat = pd.to_numeric(df.to_numpy().ravel(), errors="coerce")
-    flat = flat[~np.isnan(flat)]
-    if flat.size == 0:
-        return False  # データなし → percent 扱い
-    q95 = float(np.quantile(np.abs(flat), 0.95))
-    return q95 < 0.5
+    vals = pd.to_numeric(df.to_numpy().ravel(), errors="coerce")
+    vals = vals[~np.isnan(vals)]
+    if vals.size == 0:
+        return False
+    # だいたいのスケール判定：95%点が0.5未満 → ratio（= 0.5%未満が多い）
+    return float(np.quantile(np.abs(vals), 0.95)) < 0.5
 
 
 def _to_index_percent(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
-    """
-    行方向に等加重平均し、%単位の Series を返す。
-    csv_unit:
-      - percent: そのまま平均
-      - ratio  : 100倍して%に直して平均
-      - auto   : 判定して上記いずれか
-    """
     if df_session.empty:
         return pd.Series(dtype=float)
 
@@ -141,15 +164,17 @@ def _to_index_percent(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
 
     df_use = df_session.copy()
     if unit == "ratio":
-        df_use = df_use * 100.0
+        df_use = df_use * 100.0  # 小数倍率 → %
 
-    # 等加重平均（NaN除外）
+    # 等加重平均（NaN 除外）
     series_pct = df_use.mean(axis=1, skipna=True)
 
-    # 極端なスパイクを軽く抑制（任意）
+    # 大外れ緩和（必要に応じ調整）
     series_pct = series_pct.clip(lower=-25.0, upper=25.0)
     return series_pct
 
+
+# -------------------- 出力 --------------------
 
 def _format_sign_pct(x: float) -> str:
     return f"{x:+.2f}%"
@@ -180,7 +205,6 @@ def _save_json(path: Path, index_key: str, label: str, pct_last: float,
 
 
 def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
-    # ダーク背景・凡例なし（白枠無し）
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
     fig.patch.set_facecolor("#000000")
@@ -188,12 +212,12 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
 
     if not series_pct.empty:
         ax.plot(series_pct.index, series_pct.values, linewidth=2.0)
-
         last_ts = pd.to_datetime(series_pct.index[-1]).tz_convert(JST)
         ax.set_title(f"{label} Intraday Snapshot ({last_ts.strftime('%Y/%m/%d %H:%M')})")
     else:
         ax.set_title(f"{label} Intraday Snapshot (no data)")
 
+    # 枠線は淡色、凡例は出さない（白枠ラベル無し）
     for side in ["top", "right", "left", "bottom"]:
         ax.spines[side].set_visible(True)
         ax.spines[side].set_color("#444444")
@@ -206,7 +230,7 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
     plt.close(fig)
 
 
-# ---------- main ----------
+# -------------------- main --------------------
 
 def main() -> int:
     args = parse_args()
@@ -214,23 +238,22 @@ def main() -> int:
     print(f"VALUE_TYPE(default=percent) = {args.value_type}")
     print(f"CSV_UNIT = {args.csv_unit}")
 
-    # 1) load & JST
-    df = _read_csv_jst(args.csv, args.dt_col)
-    print(f"[make_intraday_post] CSV: rows={len(df)}, cols={list(df.columns)}")
+    # 1) CSV → JST
+    df = _read_csv_jst(args.csv, args.dt_col if args.dt_col else None)
 
-    # 2) session slice
+    # 2) セッション抽出
     df_sess = _session_slice(df, args.session_start, args.session_end)
     if df_sess.empty:
         raise ValueError("セッション時間帯に該当するデータがありません。")
 
-    # 3) % series
+    # 3) %系列に変換して等加重指数化
     series_pct = _to_index_percent(df_sess, args.csv_unit)
 
-    # 4) last value (%)
+    # 4) 終値（最後の値, %）
     pct_last = float(np.round(series_pct.iloc[-1], 4)) if not series_pct.empty else 0.0
     now_ts_jst = pd.Timestamp.now(tz=JST)
 
-    # 5) outputs
+    # 5) 出力
     _plot_series(Path(args.snapshot_png), args.label, series_pct)
     print(f"[make_intraday_post] snapshot saved -> {args.snapshot_png}")
 
