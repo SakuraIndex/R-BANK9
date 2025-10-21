@@ -23,6 +23,7 @@ on:
         description: "Value type: ratio | percent (override default)"
         required: false
         default: ""
+
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
     - cron: "35 6 * * 1-5"   # JST 15:35
@@ -33,6 +34,24 @@ permissions:
 concurrency:
   group: rbank9-intraday-${{ github.ref }}
   cancel-in-progress: false
+
+# ====== ここを各指数に合わせて変更 ======
+env:
+  INDEX_KEY: R_BANK9
+  LABEL: R-BANK9
+  CSV: docs/outputs/rbank9_intraday.csv
+  OUT_JSON: docs/outputs/rbank9_stats.json
+  OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
+  SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
+  DT_COL: "Unnamed: 0"        # CSV の時刻列名。コロン含む場合は必ずクォート
+  BASIS_DEFAULT: prev_close
+  VALUE_TYPE_DEFAULT: percent # 既定を常に percent に固定
+  # --- サイト公開先 ---
+  SITE_OWNER: SakuralIndex
+  SITE_REPO: Sakura-Index-Site   # ← 正しいリポ名（ハイフン入り）
+  SITE_BRANCH: main
+  SITE_SUBDIR: docs/charts       # サイト側の格納ルート
+# =======================================
 
 jobs:
   build:
@@ -60,26 +79,22 @@ jobs:
         run: |
           set -e
           test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 1)
-          test -f docs/outputs/rbank9_intraday.csv || (echo "Missing docs/outputs/rbank9_intraday.csv" && exit 1)
+          test -f "${CSV}" || (echo "Missing ${CSV}" && exit 1)
           echo "All inputs verified."
 
       - name: Generate intraday snapshot and post
         env:
-          INDEX_KEY: R_BANK9
-          CSV: docs/outputs/rbank9_intraday.csv
-          OUT_JSON: docs/outputs/rbank9_stats.json
-          OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
-          SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
           SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END: ${{ inputs.session_end || '15:30' }}
-          DAY_ANCHOR: ${{ inputs.day_anchor || '09:00' }}
-          BASIS: ${{ inputs.basis || 'prev_close' }}
-          VALUE_TYPE: ${{ inputs.value_type || 'percent' }}
-          DT_COL: "Unnamed: 0"
-          LABEL: R-BANK9
+          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
+          BASIS:         ${{ inputs.basis         || env.BASIS_DEFAULT }}
+          # 既定は percent。手入力が空なら percent を使う
+          VALUE_TYPE:    ${{ inputs.value_type != '' && inputs.value_type || env.VALUE_TYPE_DEFAULT }}
         run: |
           set -euo pipefail
-          echo "=== Generate R-BANK9 intraday snapshot ==="
+          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
+          echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
+
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -100,53 +115,49 @@ jobs:
         with:
           name: rbank9_intraday_artifacts
           path: |
-            docs/outputs/rbank9_intraday.png
-            docs/outputs/rbank9_post_intraday.txt
-            docs/outputs/rbank9_stats.json
+            ${{ env.SNAPSHOT_PNG }}
+            ${{
+              env.OUT_TEXT }}
+            ${{
+              env.OUT_JSON }}
           if-no-files-found: ignore
           retention-days: 3
 
-      - name: Commit outputs if changed
-        run: |
-          set -e
-          git config --global user.name  "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/rbank9_intraday.png \
-                  docs/outputs/rbank9_post_intraday.txt \
-                  docs/outputs/rbank9_stats.json || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(intraday): update R-BANK9 (snapshot & post)"
-            git push
-          else
-            echo "No output changes detected."
-          fi
-
-      - name: Checkout SakuraIndexSite (for publishing)
+      # ====== ここからサイト公開 ======
+      - name: Checkout Sakura-Index-Site (for publishing)
         uses: actions/checkout@v4
         with:
-          repository: Sakuralndex/SakuraIndexSite
-          path: SakuraIndexSite
+          repository: ${{ env.SITE_OWNER }}/${
+            { env.SITE_REPO }}
+          ref: ${{ env.SITE_BRANCH }}
           token: ${{ secrets.SITE_PAT }}
+          path: SakuraIndexSite
           fetch-depth: 0
 
-      - name: Publish R-BANK9 snapshot to site
+      - name: Publish ${INDEX_KEY} snapshot to site
         run: |
           set -euo pipefail
-          python SakuraIndexSite/scripts/publish_to_site.py \
-            --index-key R_BANK9 \
-            --from docs/outputs \
-            --site-root SakuraIndexSite \
-            --verbose
+          DEST="SakuraIndexSite/${SITE_SUBDIR}/${INDEX_KEY}"
+          mkdir -p "${DEST}"
+          cp -f "${SNAPSHOT_PNG}" "${DEST}/intraday.png"
+          cp -f "${OUT_TEXT}"     "${DEST}/post_intraday.txt"
+          cp -f "${OUT_JSON}"     "${DEST}/stats.json"
+
+          echo "Updated files in ${DEST}:"
+          ls -l "${DEST}"
 
       - name: Commit & push site charts
         run: |
-          set -euo pipefail
-          git -C SakuraIndexSite config user.name  "github-actions[bot]"
-          git -C SakuraIndexSite config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C SakuraIndexSite add docs/charts || true
-          if git -C SakuraIndexSite diff --cached --quiet; then
-            echo "No site changes."
+          set -e
+          cd SakuraIndexSite
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${SITE_SUBDIR}/${INDEX_KEY}/intraday.png" \
+                  "${SITE_SUBDIR}/${INDEX_KEY}/post_intraday.txt" \
+                  "${SITE_SUBDIR}/${INDEX_KEY}/stats.json" || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(${INDEX_KEY}): publish intraday snapshot"
+            git push origin "${SITE_BRANCH}"
           else
-            git -C SakuraIndexSite commit -m "publish: R-BANK9 intraday snapshot"
-            git -C SakuraIndexSite push origin main
+            echo "No site changes to commit."
           fi
