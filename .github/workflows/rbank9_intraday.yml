@@ -20,7 +20,7 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "Value type: ratio | percent (override default)"
+        description: "Value type: ratio | percent"
         required: false
         default: ""
 
@@ -35,7 +35,6 @@ concurrency:
   group: rbank9-intraday-${{ github.ref }}
   cancel-in-progress: false
 
-# ====== ここを各指数に合わせて変更 ======
 env:
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
@@ -43,15 +42,13 @@ env:
   OUT_JSON: docs/outputs/rbank9_stats.json
   OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-  DT_COL: "Unnamed: 0"        # CSV の時刻列名。コロン含む場合は必ずクォート
+  DT_COL: "Unnamed: 0"
   BASIS_DEFAULT: prev_close
-  VALUE_TYPE_DEFAULT: percent # 既定を常に percent に固定
-  # --- サイト公開先 ---
+  VALUE_TYPE_DEFAULT: percent
   SITE_OWNER: SakuralIndex
-  SITE_REPO: Sakura-Index-Site   # ← 正しいリポ名（ハイフン入り）
+  SITE_REPO: Sakura-Index-Site
   SITE_BRANCH: main
-  SITE_SUBDIR: docs/charts       # サイト側の格納ルート
-# =======================================
+  SITE_SUBDIR: docs/charts
 
 jobs:
   build:
@@ -63,7 +60,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -78,9 +74,9 @@ jobs:
       - name: Verify scripts & inputs
         run: |
           set -e
-          test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 1)
-          test -f "${CSV}" || (echo "Missing ${CSV}" && exit 1)
-          echo "All inputs verified."
+          test -f scripts/make_intraday_post.py || (echo "❌ Missing make_intraday_post.py" && exit 1)
+          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
+          echo "✅ All inputs verified."
 
       - name: Generate intraday snapshot and post
         env:
@@ -88,7 +84,6 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || env.BASIS_DEFAULT }}
-          # 既定は percent。手入力が空なら percent を使う
           VALUE_TYPE:    ${{ inputs.value_type != '' && inputs.value_type || env.VALUE_TYPE_DEFAULT }}
         run: |
           set -euo pipefail
@@ -116,19 +111,16 @@ jobs:
           name: rbank9_intraday_artifacts
           path: |
             ${{ env.SNAPSHOT_PNG }}
-            ${{
-              env.OUT_TEXT }}
-            ${{
-              env.OUT_JSON }}
+            ${{ env.OUT_TEXT }}
+            ${{ env.OUT_JSON }}
           if-no-files-found: ignore
           retention-days: 3
 
-      # ====== ここからサイト公開 ======
+      # ✅ 修正版：変数展開を正しく修復済み
       - name: Checkout Sakura-Index-Site (for publishing)
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.SITE_OWNER }}/${
-            { env.SITE_REPO }}
+          repository: "${{ env.SITE_OWNER }}/${{ env.SITE_REPO }}"
           ref: ${{ env.SITE_BRANCH }}
           token: ${{ secrets.SITE_PAT }}
           path: SakuraIndexSite
@@ -142,9 +134,7 @@ jobs:
           cp -f "${SNAPSHOT_PNG}" "${DEST}/intraday.png"
           cp -f "${OUT_TEXT}"     "${DEST}/post_intraday.txt"
           cp -f "${OUT_JSON}"     "${DEST}/stats.json"
-
-          echo "Updated files in ${DEST}:"
-          ls -l "${DEST}"
+          echo "✅ Updated: ${DEST}"
 
       - name: Commit & push site charts
         run: |
@@ -152,12 +142,10 @@ jobs:
           cd SakuraIndexSite
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${SITE_SUBDIR}/${INDEX_KEY}/intraday.png" \
-                  "${SITE_SUBDIR}/${INDEX_KEY}/post_intraday.txt" \
-                  "${SITE_SUBDIR}/${INDEX_KEY}/stats.json" || true
+          git add "${SITE_SUBDIR}/${INDEX_KEY}/" || true
           if ! git diff --cached --quiet; then
             git commit -m "chore(${INDEX_KEY}): publish intraday snapshot"
             git push origin "${SITE_BRANCH}"
           else
-            echo "No site changes to commit."
+            echo "No changes to commit."
           fi
