@@ -76,7 +76,7 @@ jobs:
           DAY_ANCHOR: ${{ inputs.day_anchor || '09:00' }}
           BASIS: ${{ inputs.basis || 'prev_close' }}
           VALUE_TYPE: ${{ inputs.value_type || 'ratio' }}
-          DT_COL: Unnamed: 0
+          DT_COL: "Unnamed: 0"   # ← コロンを含むため必ずクォート
           LABEL: R-BANK9
         run: |
           set -euo pipefail
