@@ -1,7 +1,7 @@
 name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
-  # ✅ 手動実行を確実に有効化
+  # 手動トリガー（必要な入力も用意）
   workflow_dispatch:
     inputs:
       session_start:
@@ -21,18 +21,14 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "Value type: ratio | percent"
+        description: "Value type: percent | ratio | decimal | auto"
         required: true
-        default: "ratio"
-      dt_col:
-        description: "Datetime column name (for CSV index)"
-        required: true
-        default: "Unnamed: 0"
+        default: "percent"
 
-  # ✅ 自動スケジュール実行（平日 11:35, 15:35 JST）
+  # 平日 11:35 / 15:35（JST）に自動実行
+  # GitHub Actions の cron は UTC。JST(+9) → 02:35 / 06:35 UTC
   schedule:
-    - cron: "35 2 * * 1-5" # JST 11:35
-    - cron: "35 6 * * 1-5" # JST 15:35
+    - cron: "35 2,6 * * 1-5"
 
 permissions:
   contents: write
@@ -47,47 +43,32 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      # ==========================
-      # ① リポジトリを取得
-      # ==========================
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      # ==========================
-      # ② Python 環境セットアップ
-      # ==========================
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      # ==========================
-      # ③ 依存パッケージのインストール
-      # ==========================
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # ==========================
-      # ④ 必須ファイル存在チェック
-      # ==========================
-      - name: Verify scripts & inputs
+      - name: Verify scripts & inputs exist
         run: |
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing scripts/make_intraday_post.py" && exit 2)
-          test -f docs/outputs/rbank9_intraday.csv || (echo "❌ Missing docs/outputs/rbank9_intraday.csv" && exit 2)
-          [[ "${{ inputs.session_start }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "❌ Invalid session_start"; exit 2)
-          [[ "${{ inputs.session_end }}" =~ ^[0-9]{2}:[0-9]{2}$ ]]   || (echo "❌ Invalid session_end";   exit 2)
-          [[ "${{ inputs.day_anchor }}" =~ ^[0-9]{2}:[0-9]{2}$ ]]    || (echo "❌ Invalid day_anchor";    exit 2)
+          set -euo pipefail
+          test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 2)
+          test -f docs/outputs/rbank9_intraday.csv || (echo "Missing docs/outputs/rbank9_intraday.csv" && exit 2)
+          [[ "${{ inputs.session_start || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
+          [[ "${{ inputs.session_end   || '15:30' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
+          [[ "${{ inputs.day_anchor    || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
 
-      # ==========================
-      # ⑤ 日中スナップショット生成
-      # ==========================
       - name: Generate intraday post and snapshot
         env:
           INDEX_KEY: R_BANK9
@@ -95,19 +76,18 @@ jobs:
           OUT_JSON: docs/outputs/rbank9_stats.json
           OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
           SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-          SESSION_START: ${{ inputs.session_start }}
-          SESSION_END:   ${{ inputs.session_end }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor }}
-          BASIS:         ${{ inputs.basis }}
-          VALUE_TYPE:    ${{ inputs.value_type }}
-          DT_COL:        ${{ inputs.dt_col }}
+          SESSION_START: ${{ inputs.session_start || '09:00' }}
+          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
+          BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          VALUE_TYPE:    ${{ inputs.value_type    || 'percent' }}  # R-BANK9は％前提。変える場合は手動で
+          DT_COL:        Unnamed: 0               # CSVが Datetime 列なら 'Datetime' に変更
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
           echo "=== Intraday snapshot (R-BANK9) ==="
           echo "CSV file: ${CSV}"
           echo "Datetime column: ${DT_COL}"
-
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -122,10 +102,7 @@ jobs:
             --dt-col "${DT_COL}" \
             --label "${LABEL}"
 
-      # ==========================
-      # ⑥ 成果物を保存（デバッグ用）
-      # ==========================
-      - name: Upload artifacts
+      - name: Upload artifacts (for debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -137,9 +114,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      # ==========================
-      # ⑦ 出力をコミット
-      # ==========================
       - name: Commit outputs if changed
         run: |
           set -e
@@ -148,10 +122,9 @@ jobs:
           git add docs/outputs/rbank9_intraday.png \
                   docs/outputs/rbank9_post_intraday.txt \
                   docs/outputs/rbank9_stats.json || true
-
           if ! git diff --cached --quiet; then
             git commit -m "chore(intraday): update R-BANK9 (snapshot & post)"
             git push
           else
-            echo "✅ No output changes detected."
+            echo "No output changes."
           fi
