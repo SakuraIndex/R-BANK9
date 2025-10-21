@@ -14,6 +14,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
+import json  # ← 追加：標準ライブラリで JSON を書く
 
 import pandas as pd
 import numpy as np
@@ -38,7 +39,7 @@ def to_jst_index(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
     s = df[dt_col]
 
     # まず Series を datetime へ
-    dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    dt = pd.to_datetime(s, errors="coerce")  # infer_datetime_format はデフォルト挙動に統合
 
     if dt.isna().all():
         raise ValueError("日時列の変換に失敗しました（すべてNaT）。原データ形式を確認してください。")
@@ -139,10 +140,13 @@ def compute_change(
 
 
 def save_json(out_path: Path, payload: dict):
-    out_path.write_text(pd.io.json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    """標準ライブラリ json を使用して書き出し（pandas.io.json は使用しない）"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_post_text(out_path: Path, label: str, last_pct: float, basis: str, now_jst: pd.Timestamp):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     sign = "▲" if last_pct >= 0 else "▼"
     txt = f"{sign} {label} 日中スナップショット（{now_jst.strftime('%Y/%m/%d %H:%M')}）\n" \
           f"{last_pct:+.2f}%（基準: {basis}）\n" \
@@ -159,7 +163,7 @@ def save_plot(
 
     ax.set_title(title)
     ax.set_xlabel("Time")
-    ax.set_ylabel("Change vs Prev Close (%)" if series.abs().max() > 5 else "Change (ratio)")
+    ax.set_ylabel("Change vs Prev Close (%)")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="upper left")
 
@@ -252,8 +256,8 @@ def main():
     save_json(Path(args.out_json), payload)
     save_post_text(Path(args.out_text), args.label, last_pct, args.basis, now_jst)
 
-    # グラフ（value_typeに合わせてY軸名称を自動化）
-    y = change_series * (100.0 if args.value_type == "ratio" else 1.0)  # 画像は%表示に合わせたい場合はここで調整
+    # 画像は%スケールで描画
+    y = change_series if args.value_type == "percent" else change_series * 100.0
     title = f"{args.label} Intraday Snapshot ({now_jst.strftime('%Y/%m/%d %H:%M')})"
     save_plot(Path(args.snapshot_png), y, title=title, label=args.label)
 
