@@ -1,12 +1,12 @@
 {
   "index_key": "R_BANK9",
   "label": "R-BANK9",
-  "pct_intraday": 6.04973861287466,
+  "pct_intraday": -8.43647710665473,
   "basis": "prev_close",
   "session": {
     "start": "09:00",
     "end": "15:30",
     "anchor": "09:00"
   },
-  "updated_at": "2025-10-21T14:49:48.304536+09:00"
+  "updated_at": "2025-10-21T15:08:52.014610+09:00"
 }
