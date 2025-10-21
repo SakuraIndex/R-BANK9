@@ -1,7 +1,7 @@
 name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
-  # 手動トリガー（必要な入力も用意）
+  # ← これがある限り Run workflow ボタンは表示されます
   workflow_dispatch:
     inputs:
       session_start:
@@ -25,8 +25,7 @@ on:
         required: true
         default: "percent"
 
-  # 平日 11:35 / 15:35（JST）に自動実行
-  # GitHub Actions の cron は UTC。JST(+9) → 02:35 / 06:35 UTC
+  # 平日 11:35 / 15:35（JST）（= UTC 02:35 / 06:35）
   schedule:
     - cron: "35 2,6 * * 1-5"
 
@@ -80,14 +79,13 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ inputs.value_type    || 'percent' }}  # R-BANK9は％前提。変える場合は手動で
-          DT_COL:        Unnamed: 0               # CSVが Datetime 列なら 'Datetime' に変更
+          VALUE_TYPE:    ${{ inputs.value_type    || 'percent' }}
+          DT_COL:        Unnamed: 0
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
           echo "=== Intraday snapshot (R-BANK9) ==="
           echo "CSV file: ${CSV}"
-          echo "Datetime column: ${DT_COL}"
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
