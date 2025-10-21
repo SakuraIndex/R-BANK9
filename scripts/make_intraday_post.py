@@ -2,357 +2,308 @@
 # -*- coding: utf-8 -*-
 
 """
-make_intraday_post.py
+Intraday snapshot & post generator
 
-任意のインデックス/合成シリーズの「日中スナップショット」を作成し、
-- PNG（折れ線チャート）
-- TXT（ポスト用の短文）
-- JSON（メタ情報）
-
-を出力します。
-
-主な特徴
-- CSV の日時列名や値列名を自動推定（--dt-col / --index-key で明示も可）
-- タイムゾーンは自動判別して JST へ。tz-aware でも naive でも安全に処理
-- セッション（start/end）は同一営業日内で抽出。データが無い場合は
-  範囲と CSV の実データ範囲を丁寧に表示して失敗
-- 基準値（basis）は列名で指定でき、無ければ prev_close 系の列を探索、
-  それも無ければ「セッション最初値」を使用
-- 目盛りの白枠（spines）を非表示にした黒背景のチャート
-- 値の種類 value_type は受け取りますが、出力は “％表示” を標準化
-  （実用上もっとも分かりやすいため）
-
-使い方（例）
-python scripts/make_intraday_post.py \
-  --index-key "R_BANK9" \
-  --csv docs/outputs/rbank9_intraday.csv \
-  --out-json docs/outputs/rbank9_stats.json \
-  --out-text docs/outputs/rbank9_post_intraday.txt \
-  --snapshot-png docs/outputs/rbank9_intraday.png \
-  --session-start "09:00" \
-  --session-end   "15:30" \
-  --day-anchor    "09:00" \
-  --basis "prev_close" \
-  --value-type "ratio" \
-  --dt-col "Unnamed: 0" \
-  --label "R-BANK9"
+- 入力 CSV から指定列の intraday 系列を取り出し、前日終値比 or 指定アンカー比の推移を描画/集計
+- CSV がレベル（指数値）か、すでに % / 比率の「前日比」なのかを自動判定 or 明示指定
+- 生成物:
+  - PNG グラフ: --snapshot-png
+  - テキスト:   --out-text
+  - JSON 統計:  --out-json （pct_intraday は % 数値）
 """
 
 from __future__ import annotations
-
 import argparse
-import math
-import re
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from pathlib import Path
+import sys
+import math
 
-import numpy as np
 import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 
 JST = "Asia/Tokyo"
 
 
-# ---------- ユーティリティ ----------
-
-def to_jst_index(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
-    """任意の日時列を受け取り、JST の DatetimeIndex に変換して返す。
-    tz-aware -> tz_convert(JST)
-    naive    -> tz_localize(JST)
-    """
-    if dt_col not in df.columns:
-        raise ValueError(f"CSV に日時列 '{dt_col}' が見つかりません。候補: {list(df.columns)}")
-
-    ts = pd.to_datetime(df[dt_col], errors="coerce", utc=False)
-    if ts.isna().all():
-        raise ValueError(f"日時列 '{dt_col}' を datetime に変換できません。値の例: {df[dt_col].head(3).tolist()}")
-
-    # 可能なら tz 情報を確認
-    if ts.dt.tz is not None:
-        # すでに tz-aware
-        ts = ts.dt.tz_convert(JST)
-    else:
-        # naive → JST とみなす（データが JST で吐かれている前提が多いため）
-        ts = ts.dt.tz_localize(JST)
-
-    out = df.copy()
-    out.index = ts
-    return out.drop(columns=[dt_col])
-
-
-def parse_hhmm_jst(s: str, anchor_date: pd.Timestamp) -> pd.Timestamp:
-    m = re.fullmatch(r"(\d{2}):(\d{2})", s.strip())
-    if not m:
-        raise ValueError(f"時刻は HH:MM 形式で指定してください（例: 09:00）。受け取った値: {s}")
-    hh, mm = int(m.group(1)), int(m.group(2))
-    # anchor_date は JST の tz-aware を想定
-    return anchor_date.replace(hour=hh, minute=mm, second=0, microsecond=0)
-
-
-def filter_session(df_jst: pd.DataFrame, session_start: str, session_end: str, anchor_time: str) -> pd.DataFrame:
-    """同一営業日（= データの最後のタイムスタンプの日）における
-    セッション（start/end）だけを抽出する。
-    """
-    if df_jst.empty:
-        raise ValueError("CSV が空です。")
-
-    last_ts: pd.Timestamp = df_jst.index.max()
-    if last_ts.tz is None:
-        # 念のため
-        last_ts = last_ts.tz_localize(JST)
-
-    anchor_date = last_ts.tz_convert(JST).normalize()
-    # 「ラベル用」の日付は末尾のデータ日付
-    day_start = parse_hhmm_jst(session_start, anchor_date)
-    day_end = parse_hhmm_jst(session_end, anchor_date)
-
-    if day_end <= day_start:
-        # 23:55〜00:05 のような跨ぎには対応しない方針
-        raise ValueError(f"セッション時刻の順序が不正です（start={session_start}, end={session_end}）。同一営業日内で指定してください。")
-
-    out = df_jst.loc[(df_jst.index >= day_start) & (df_jst.index <= day_end)].copy()
-
-    if out.empty:
-        rng = f"{day_start.strftime('%Y-%m-%d %H:%M %Z')} 〜 {day_end.strftime('%Y-%m-%d %H:%M %Z')}"
-        have = f"{df_jst.index.min().strftime('%Y-%m-%d %H:%M %Z')} 〜 {df_jst.index.max().strftime('%Y-%m-%d %H:%M %Z')}"
-        raise ValueError(f"セッション内データがありません。指定範囲: {session_start}–{session_end} JST / データ範囲: {have}（抽出対象日: {rng}）")
-
-    return out
-
-
-def pick_value_column(df: pd.DataFrame, index_key: str) -> str:
-    """インデックス/系列の値列を推定する。
-    - index_key（完全一致）
-    - 大文字/小文字/ハイフン/アンダースコアの差を吸収した一致
-    - "<index_key>_mean" などの部分一致
-    - 最後の数値列（日時列や 'Unnamed: 0' を除く）
-    """
-    cols = list(df.columns)
-
-    normalized = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
-
-    target_norm = normalized(index_key)
-    # 1) 完全一致（ゆるい正規化後）
-    for c in cols:
-        if normalized(c) == target_norm:
-            return c
-
-    # 2) _mean, _index, - などを吸収
-    for c in cols:
-        if target_norm in normalized(c):
-            return c
-
-    # 3) 末尾の数値列を最後の手段として使う（Unnamed, index など除外）
-    numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-    if not numeric_cols:
-        raise ValueError(f"数値列が見つかりません。columns={cols}")
-    # Unnamed 系を除外
-    numeric_cols = [c for c in numeric_cols if not re.match(r"unnamed", c, flags=re.I)]
-    if not numeric_cols:
-        raise ValueError(f"数値列が見つかりません（Unnamed を除外後）。columns={cols}")
-
-    return numeric_cols[-1]
-
-
-def find_basis_value(df: pd.DataFrame, val_col: str, basis_col: Optional[str]) -> float:
-    """基準値の探索ロジック。
-    優先順位：
-      1) --basis で列名が指定されていればそれを最優先
-      2) prev_close / close_yesterday 等の列があれば使用
-      3) なければ「セッション最初値」
-    """
-    candidates: list[str] = []
-    if basis_col:
-        candidates.append(basis_col)
-
-    # よくある列名
-    for patt in ("prev_close", "previous_close", "close_yesterday", "prevclose", "base"):
-        for c in df.columns:
-            if re.search(patt, c, flags=re.I):
-                candidates.append(c)
-
-    for c in candidates:
-        if c in df.columns:
-            base = float(df[c].iloc[0])
-            if not (math.isnan(base) or base == 0.0):
-                return base
-
-    # fallback: セッションの最初値
-    base = float(df[val_col].iloc[0])
-    if math.isnan(base) or base == 0.0:
-        raise ValueError("基準値を決定できません（NaN または 0）。--basis で列名を指定するか、CSV を確認してください。")
-    return base
-
-
-def compute_change_percent(df: pd.DataFrame, val_col: str, basis_col: Optional[str]) -> pd.Series:
-    """％変化（前日終値や最初値に対する変化）を返す。単位は percent（例: 3.5 は +3.5%）。"""
-    base = find_basis_value(df, val_col, basis_col)
-    series = pd.to_numeric(df[val_col], errors="coerce")
-    if series.isna().all():
-        raise ValueError(f"値列 '{val_col}' に数値がありません。")
-
-    chg_ratio = series / float(base) - 1.0
-    chg_pct = chg_ratio * 100.0
-    return chg_pct
-
-
-@dataclass
-class Args:
-    index_key: str
-    csv: str
-    out_json: str
-    out_text: str
-    snapshot_png: str
-    session_start: str
-    session_end: str
-    day_anchor: str
-    basis: Optional[str]
-    value_type: str  # 互換のため受け取るが、出力は percent に統一
-    dt_col: Optional[str]
-    label: Optional[str]
-
-
-def parse_args() -> Args:
+# ---------- CLI ----------
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--index-key", required=True, dest="index_key")
-    p.add_argument("--csv", required=True)
-    p.add_argument("--out-json", required=True, dest="out_json")
-    p.add_argument("--out-text", required=True, dest="out_text")
-    p.add_argument("--snapshot-png", required=True, dest="snapshot_png")
-    p.add_argument("--session-start", required=True, dest="session_start")
-    p.add_argument("--session-end", required=True, dest="session_end")
-    p.add_argument("--day-anchor", required=True, dest="day_anchor")
-    p.add_argument("--basis", required=False, default=None, dest="basis",
-                   help="基準列名（例: prev_close）。無い場合は prev_close 系を探索し、見つからなければ最初値。")
-    p.add_argument("--value-type", required=False, default="percent",
-                   help="互換用の引数。入出力とも最終的には％表示で統一します（ratio を渡しても％で出力）。")
-    p.add_argument("--dt-col", required=False, default=None,
-                   help="日時列名。省略時は 'Datetime' や先頭列などを自動推定。")
-    p.add_argument("--label", required=False, default=None,
-                   help="凡例/タイトル用ラベル。省略時は index_key を使用。")
-    a = p.parse_args()
-
-    return Args(
-        index_key=a.index_key,
-        csv=a.csv,
-        out_json=a.out_json,
-        out_text=a.out_text,
-        snapshot_png=a.snapshot_png,
-        session_start=a.session_start,
-        session_end=a.session_end,
-        day_anchor=a.day_anchor,
-        basis=a.basis,
-        value_type=str(a.value_type or "percent").lower(),
-        dt_col=a.dt_col,
-        label=a.label,
-    )
+    p.add_argument("--index-key", required=True, help="Index key label (e.g., R_BANK9)")
+    p.add_argument("--csv", required=True, help="Input CSV path")
+    p.add_argument("--out-json", required=True, help="Output JSON path")
+    p.add_argument("--out-text", required=True, help="Output text path")
+    p.add_argument("--snapshot-png", required=True, help="Output PNG path")
+    p.add_argument("--session-start", required=True, help="HH:MM JST")
+    p.add_argument("--session-end", required=True, help="HH:MM JST")
+    p.add_argument("--day-anchor", required=True, help="HH:MM JST label anchor")
+    p.add_argument("--basis", default="prev_close", choices=["prev_close", "open@09:00"],
+                   help="Change basis: prev_close | open@09:00")
+    p.add_argument("--value-type", default="percent", choices=["percent", "ratio"],
+                   help="How to *report* values: percent(%) or ratio(=1.0 is +100%). Internals unify to percent.")
+    p.add_argument("--dt-col", default="Datetime",
+                   help="Datetime column name in CSV. If missing, tries first column as datetime index.")
+    p.add_argument("--label", default="", help="Series legend label (for chart legend)")
+    # 追加: 入力の意味を制御
+    p.add_argument("--assume-change", default="auto",
+                   choices=["auto", "level", "pct", "ratio"],
+                   help=("Meaning of the CSV data column for index-key: "
+                         "level=レベル値, pct=すでに前日比(%) , ratio=すでに前日比(比率), auto=自動判定"))
+    return p
 
 
-# ---------- 描画 ----------
+# ---------- TZ helpers ----------
+def to_jst_index(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
+    if dt_col in df.columns:
+        ts = pd.to_datetime(df[dt_col], errors="coerce", utc=True)
+        # もし tz-naive が混在するなら一括で UTC とみなす
+        if ts.dt.tz is None:
+            ts = pd.to_datetime(df[dt_col], errors="coerce").dt.tz_localize("UTC")
+        df = df.drop(columns=[dt_col])
+        df.index = ts.dt.tz_convert(JST)
+    else:
+        # インデックスが時刻（文字列/naive/aware）で来るケース
+        idx = pd.to_datetime(df.index, errors="coerce")
+        if hasattr(idx, "tz") and idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx = idx.tz_convert(JST)
+        df.index = idx
+    # sort + dropna index
+    df = df[~df.index.isna()].sort_index()
+    return df
 
-def plot_snapshot(
-    ts: pd.DatetimeIndex,
-    y_pct: pd.Series,
-    label: str,
-    title_day: str,
-    out_png: str,
-) -> None:
-    """黒背景・枠線ナシのスナップショットを描画して保存。"""
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=(12, 6), facecolor="black")
-    ax.set_facecolor("black")
 
-    # 線色は視認性の高いシアン
-    ax.plot(ts, y_pct.values, linewidth=2.0, color="#10e0e0", label=label)
+# ---------- 判定/変換 ----------
+def looks_like_pct(series: pd.Series) -> bool:
+    """すでに %（例: -10〜+10 程度のレンジが多い）っぽいか"""
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return False
+    mx = float(s.abs().quantile(0.98))
+    # 前日比%として自然と思えるレンジ（±100%以内がほとんど）
+    return mx <= 100.0
 
-    # 枠線（spines）を消す
+def looks_like_ratio(series: pd.Series) -> bool:
+    """すでに比率（-0.3〜0.3 など 1.0 で +100% にするタイプ）っぽいか"""
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return False
+    mx = float(s.abs().quantile(0.98))
+    # 比率は通常 ±1.0 以内（±100%）に収まることが多い（例: 0.05=+5%）
+    return mx <= 1.0
+
+def as_percent(series: pd.Series, assume: str) -> pd.Series:
+    """
+    入力 series を「%値（-5.0 = -5%）」に正規化して返す。
+    assume:
+      - level : レベル値（指数/価格） -> そのままでは%にならない（後で基準と合わせて%化する）
+      - pct   : すでに% -> そのまま
+      - ratio : すでに比率 -> ×100
+      - auto  : 列名/レンジから推定
+    """
+    name = series.name or ""
+    if assume == "auto":
+        # 列名ヒント
+        lname = name.lower()
+        if any(k in lname for k in ["pct", "%", "percent"]):
+            assume_eff = "pct"
+        elif any(k in lname for k in ["ratio", "ret", "return"]):
+            assume_eff = "ratio"
+        else:
+            # 数値レンジから推定
+            if looks_like_ratio(series):
+                assume_eff = "ratio"
+            elif looks_like_pct(series):
+                assume_eff = "pct"
+            else:
+                assume_eff = "level"
+    else:
+        assume_eff = assume
+
+    if assume_eff == "pct":
+        return series.astype(float)
+    if assume_eff == "ratio":
+        return series.astype(float) * 100.0
+    # level は % にまだしていない（後段で基準と組み合わせ）
+    series.attrs["__as_level__"] = True
+    return series.astype(float)
+
+
+# ---------- セッション抽出 ----------
+@dataclass
+class Session:
+    start: pd.Timestamp
+    end: pd.Timestamp
+
+def parse_hm_jst(hm: str, date: pd.Timestamp) -> pd.Timestamp:
+    h, m = map(int, hm.split(":"))
+    return pd.Timestamp(year=date.year, month=date.month, day=date.day, hour=h, minute=m, tz=JST)
+
+def filter_session(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> tuple[pd.DataFrame, Session]:
+    if df_jst.empty:
+        raise ValueError("入力データが空です。")
+    day = df_jst.index[-1].normalize().tz_convert(JST)
+    start = parse_hm_jst(start_hm, day)
+    end   = parse_hm_jst(end_hm,   day)
+    out = df_jst[(df_jst.index >= start) & (df_jst.index <= end)].copy()
+    if out.empty:
+        raise ValueError(f"セッション内データがありません。指定範囲: {start_hm}–{end_hm} JST / "
+                         f"データ範囲: {df_jst.index.min()} – {df_jst.index.max()}")
+    return out, Session(start, end)
+
+
+# ---------- メイン計算 ----------
+def compute_change_pct(series: pd.Series, basis: str, anchor_hm: str) -> pd.Series:
+    """
+    series: すでに as_percent() 済み（%）か、attrs['__as_level__']=True のレベル値
+    basis:  prev_close | open@09:00
+    戻り値: 常に %（float）
+    """
+    if series.attrs.get("__as_level__", False):
+        # レベル -> % へ変換
+        s = series.astype(float)
+        if basis == "prev_close":
+            # 前場の最初の点（または 09:00 直後）を「前日終値近傍」とみなすのではなく、
+            # 当日最初の観測からの相対を採用（前日終値にぴったり一致しない指数でも暴れにくい）
+            ref = s.iloc[0]
+        else:  # open@09:00
+            # 09:00 以降で最初に観測できた値
+            # （minute 欠損があっても最初の点を anchor として使う）
+            ref = s.iloc[0]
+        eps = 1e-12
+        change_pct = (s / max(ref, eps) - 1.0) * 100.0
+        return change_pct
+    else:
+        # すでに % 値（または ratio から%化済み）
+        # prev_close / open@09:00 いずれでも「入力がすでに前日比」であれば、そのまま扱う
+        return series.astype(float)
+
+
+# ---------- 出力 ----------
+def render_plot(idx_label: str,
+                series_pct: pd.Series,
+                png_path: Path,
+                legend_label: str,
+                title_stamp: str) -> None:
+    fig = plt.figure(figsize=(12, 6), dpi=150)
+    ax = plt.gca()
+    ax.plot(series_pct.index, series_pct.values, linewidth=2.0)
+    ax.set_title(f"{idx_label} Intraday Snapshot ({title_stamp})")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Change vs Basis (%)")
+    # 余白の白縁を消す（要望）
     for spine in ax.spines.values():
         spine.set_visible(False)
-
-    # 目盛り色
-    ax.tick_params(colors="#c8c8c8")
-    ax.yaxis.label.set_color("#c8c8c8")
-    ax.xaxis.label.set_color("#c8c8c8")
-
-    ax.set_title(f"{label} Intraday Snapshot ({title_day})", color="#eaeaea", fontsize=14, pad=12)
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Change vs Prev Close (%)")
-
-    ax.legend(facecolor="black", edgecolor="none", labelcolor="#eaeaea")
-
+    ax.legend([legend_label or idx_label], loc="upper left")
+    ax.grid(False)
     fig.tight_layout()
-    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path)
     plt.close(fig)
 
 
-# ---------- 本体 ----------
+def write_text(out_path: Path, label: str, pct_now: float, basis: str, now_jst: pd.Timestamp):
+    sgn = "▲" if pct_now >= 0 else "▼"
+    out = [
+        f"{sgn} {label} 日中スナップショット（{now_jst.strftime('%Y/%m/%d %H:%M')}）",
+        f"{pct_now:+.2f}%（基準: {basis}）",
+        f"#{label} #日本株",
+    ]
+    out_path.write_text("\n".join(out), encoding="utf-8")
 
-def main() -> None:
-    args = parse_args()
+
+def write_json(out_path: Path, index_key: str, label: str, pct_now: float,
+               basis: str, sess: Session, now_jst: pd.Timestamp):
+    payload = {
+        "index_key": index_key,
+        "label": label or index_key,
+        "pct_intraday": float(pct_now),  # 常に % 数値
+        "basis": basis,
+        "session": {"start": sess.start.strftime("%H:%M"),
+                    "end":   sess.end.strftime("%H:%M"),
+                    "anchor": "09:00"},
+        "updated_at": now_jst.isoformat(),
+    }
+    out_path.write_text(pd.io.json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---------- main ----------
+def main() -> int:
+    ap = build_parser()
+    args = ap.parse_args()
+
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        print(f"CSV が見つかりません: {csv_path}", file=sys.stderr)
+        return 1
 
     # CSV 読み込み
-    raw = pd.read_csv(args.csv)
-
-    # 日時列の推定（指定 > 'Datetime' > 'date' > 先頭列）
-    dt_col = args.dt_col
-    if dt_col is None:
-        for cand in ("Datetime", "datetime", "Date", "date", "timestamp", "Timestamp"):
-            if cand in raw.columns:
-                dt_col = cand
+    raw = pd.read_csv(csv_path)
+    # index-key 列を特定（完全一致が無ければ先頭の非日時列のうち、index-key に近いもの）
+    # まずは完全一致 or 大文字小文字無視一致を探す
+    col = None
+    if args.index_key in raw.columns:
+        col = args.index_key
+    else:
+        # 大文字小文字・ハイフン/アンダースコア等を緩く比較
+        def norm(s: str) -> str:
+            return "".join(ch for ch in s.upper() if ch.isalnum())
+        target = norm(args.index_key)
+        for c in raw.columns:
+            if norm(str(c)) == target:
+                col = c
                 break
-        if dt_col is None:
-            # 先頭列を日時列とみなす（Unnamed: 0 など想定）
-            dt_col = raw.columns[0]
+        if col is None:
+            # 「_mean」「_avg」など代表列があれば採用
+            for c in raw.columns:
+                lc = str(c).lower()
+                if any(k in lc for k in ["_mean", "_avg", "composite", "index", "rbank9", "r_bank9"]):
+                    col = c
+                    break
+    if col is None:
+        # 最後の砦: 数値列のうち NaN が少ない列を代表に
+        num_cols = [c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])]
+        if num_cols:
+            col = num_cols[0]
+    if col is None:
+        print(f"CSV に対象列 '{args.index_key}' がありません。列={list(raw.columns)}", file=sys.stderr)
+        return 1
 
-    df_jst = to_jst_index(raw, dt_col=dt_col)
+    # Datetime インデックス化
+    df = raw.set_index(args.dt_col) if args.dt_col in raw.columns else raw.set_index(raw.columns[0])
+    df = to_jst_index(df, args.dt_col)
+    if df.empty:
+        print("CSV から JST 時系列を構築できませんでした。", file=sys.stderr)
+        return 1
 
-    # 値列の特定
-    val_col = pick_value_column(df_jst, args.index_key)
+    # セッション抽出
+    df_sess, sess = filter_session(df, args.session_start, args.session_end)
 
-    # 同一営業日のセッション抽出
-    df_sess = filter_session(df_jst, args.session_start, args.session_end, args.day_anchor)
+    # 値の意味を % に正規化
+    series_in = df_sess[col].astype(float)
+    series_pct_like = as_percent(series_in, args.assume_change)  # % 値 or レベル (attrs フラグ)
 
-    # ％変化を算出（出力は％に統一）
-    y_pct = compute_change_percent(df_sess, val_col=val_col, basis_col=args.basis)
+    # % に確定
+    series_pct = compute_change_pct(series_pct_like, args.basis, args.day_anchor)
+    series_pct = series_pct.replace([np.inf, -np.inf], np.nan).dropna()
+    if series_pct.empty:
+        print("セッション内に有効データがありません（変換後）。", file=sys.stderr)
+        return 1
 
-    # 見出し（タイトル用日付）
-    last_ts = df_sess.index.max().tz_convert(JST)
-    title_day = last_ts.strftime("%Y/%m/%d %H:%M")
+    # 直近 % 値
+    pct_now = float(series_pct.iloc[-1])
 
-    # チャート
-    label = args.label or args.index_key
-    plot_snapshot(df_sess.index, y_pct, label=label, title_day=title_day, out_png=args.snapshot_png)
+    # 出力
+    now_jst = pd.Timestamp.now(tz=JST)
+    label = (args.label or args.index_key).upper()
+    render_plot(label, series_pct, Path(args.snapshot_png), label, now_jst.strftime("%Y/%m/%d %H:%M"))
+    write_text(Path(args.out_text), label, pct_now, args.basis, now_jst)
+    write_json(Path(args.out_json), args.index_key, label, pct_now, args.basis, sess, now_jst)
 
-    # ポスト用テキスト
-    latest_pct = float(y_pct.iloc[-1])
-    arrow = "▲" if latest_pct >= 0 else "▼"
-    sign = "+" if latest_pct >= 0 else ""
-    post_lines = [
-        f"{arrow} {label} 日中スナップショット（{title_day}）",
-        f"{sign}{latest_pct:.2f}%（基準: {args.basis or 'prev_close/first'}）",
-        f"#{args.index_key.replace('_', '-')}"  # ハッシュタグ的に
-    ]
-    with open(args.out_text, "w", encoding="utf-8") as f:
-        f.write("\n".join(post_lines))
-
-    # JSON
-    stats = {
-        "index_key": args.index_key,
-        "label": label,
-        "pct_intraday": latest_pct,     # ％で保存（例: 3.52 は +3.52%）
-        "basis": args.basis or "prev_close/first",
-        "session": {
-            "start": args.session_start,
-            "end": args.session_end,
-            "anchor": args.day_anchor,
-        },
-        "updated_at": last_ts.isoformat(),
-    }
-    import json
-    with open(args.out_json, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
