@@ -22,18 +22,13 @@ on:
       value_type:
         description: "Value type: ratio | percent (override default)"
         required: false
-        default: ""
+        default: ""   # 手動実行フォームで空ならスクリプト側デフォルト(percent)が採用されます
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
     - cron: "35 6 * * 1-5"   # JST 15:35
 
 permissions:
   contents: write
-
-# ここで「既定の値」を一元管理（必要なら repo Variables に切替も可）
-# 例: vars.RBANK9_VALUE_TYPE を作成してあれば、下行を env: { DEFAULT_VALUE_TYPE: ${{ vars.RBANK9_VALUE_TYPE }} } に。
-env:
-  DEFAULT_VALUE_TYPE: percent
 
 concurrency:
   group: rbank9-intraday-${{ github.ref }}
@@ -79,14 +74,14 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          # ここが肝心：手動実行で値が入ればそれを採用、なければ DEFAULT_VALUE_TYPE（=percent）
-          VALUE_TYPE:    ${{ (inputs.value_type && inputs.value_type != '' && inputs.value_type) || env.DEFAULT_VALUE_TYPE }}
-          DT_COL: "Unnamed: 0"     # ← コロンを含むので必ずクォート
-          LABEL: R-BANK9
+          # 空文字なら Python 側 default(percent) を使用
+          VALUE_TYPE:    ${{ inputs.value_type }}
+          DT_COL:        "Unnamed: 0"  # コロンを含むためクォート必須
+          LABEL:         R-BANK9
         run: |
           set -euo pipefail
           echo "=== Generate R-BANK9 intraday snapshot ==="
-          echo "VALUE_TYPE=${VALUE_TYPE} (default=${DEFAULT_VALUE_TYPE})"
+          echo "VALUE_TYPE=${VALUE_TYPE:-<empty>}"
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -97,7 +92,7 @@ jobs:
             --session-end "${SESSION_END}" \
             --day-anchor "${DAY_ANCHOR}" \
             --basis "${BASIS}" \
-            --value-type "${VALUE_TYPE}" \
+            ${VALUE_TYPE:+--value-type "${VALUE_TYPE}"} \
             --dt-col "${DT_COL}" \
             --label "${LABEL}"
 
@@ -116,14 +111,8 @@ jobs:
       - name: Commit outputs if changed
         run: |
           set -e
-          git config --global user.name "github-actions[bot]"
+          git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/rbank9_intraday.png \
-                  docs/outputs/rbank9_post_intraday.txt \
-                  docs/outputs/rbank9_stats.json || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(intraday): update R-BANK9 (snapshot & post)"
-            git push
-          else
-            echo "No output changes detected."
-          fi
+          git add -A
+          git commit -m "chore(intraday): update R-BANK9 (snapshot & post)" || true
+          git push || true
