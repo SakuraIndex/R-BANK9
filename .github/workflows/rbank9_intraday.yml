@@ -20,9 +20,10 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "Value type: ratio | percent (override default)"
-        required: false
-        default: ""   # 手動実行フォームで空ならスクリプト側デフォルト(percent)が採用されます
+        description: "Value type: ratio | percent"
+        required: true
+        default: "percent"  # ←★ここを ratio→percent に固定（常時percentで動作）
+
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
     - cron: "35 6 * * 1-5"   # JST 15:35
@@ -74,8 +75,7 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          # 空文字なら Python 側 default(percent) を使用
-          VALUE_TYPE:    ${{ inputs.value_type }}
+          VALUE_TYPE:    ${{ inputs.value_type || 'percent' }}  # ←ここでも確実にpercent固定
           DT_COL:        "Unnamed: 0"  # コロンを含むためクォート必須
           LABEL:         R-BANK9
         run: |
@@ -92,7 +92,7 @@ jobs:
             --session-end "${SESSION_END}" \
             --day-anchor "${DAY_ANCHOR}" \
             --basis "${BASIS}" \
-            ${VALUE_TYPE:+--value-type "${VALUE_TYPE}"} \
+            --value-type "${VALUE_TYPE}" \
             --dt-col "${DT_COL}" \
             --label "${LABEL}"
 
