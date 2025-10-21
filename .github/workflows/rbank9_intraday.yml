@@ -1,4 +1,4 @@
-name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
+name: R-BANK9 • intraday snapshot (publish to site)
 
 on:
   workflow_dispatch:
@@ -15,14 +15,6 @@ on:
         description: "Day anchor time (HH:MM JST)"
         required: true
         default: "09:00"
-      basis:
-        description: "Return basis label"
-        required: true
-        default: "prev_close"
-      value_type:
-        description: "Value type: ratio | percent"
-        required: false
-        default: ""
 
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
@@ -36,27 +28,30 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # === 固定値（ここが誤っていると checkout に失敗します）===
+  SITE_REPO: SakuraIndex/SakuraIndexSite   # ← ハイフン無しの正しい名前
+  SITE_BRANCH: main
+  # サイト側に置くパス（必要に応じて変更）
+  SITE_PATH: charts/rbank9
+
+  # 生成物のキーと入出力
   INDEX_KEY: R_BANK9
-  LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
   OUT_JSON: docs/outputs/rbank9_stats.json
   OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
   DT_COL: "Unnamed: 0"
-  BASIS_DEFAULT: prev_close
-  VALUE_TYPE_DEFAULT: percent
-  SITE_OWNER: SakuralIndex
-  SITE_REPO: Sakura-Index-Site
-  SITE_BRANCH: main
-  SITE_SUBDIR: docs/charts
+  LABEL: R-BANK9
+  BASIS: prev_close
+  VALUE_TYPE: percent
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
-      - name: Checkout repository
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -71,25 +66,19 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Verify scripts & inputs
+      - name: Verify inputs
         run: |
-          set -e
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing make_intraday_post.py" && exit 1)
-          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          echo "✅ All inputs verified."
+          test -f scripts/make_intraday_post.py
+          test -f "${CSV}"
 
-      - name: Generate intraday snapshot and post
+      - name: Generate intraday snapshot & post
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
-          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ inputs.basis         || env.BASIS_DEFAULT }}
-          VALUE_TYPE:    ${{ inputs.value_type != '' && inputs.value_type || env.VALUE_TYPE_DEFAULT }}
+          SESSION_END: ${{ inputs.session_end || '15:30' }}
+          DAY_ANCHOR: ${{ inputs.day_anchor || '09:00' }}
         run: |
           set -euo pipefail
           echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
-          echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
-
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -104,48 +93,48 @@ jobs:
             --dt-col "${DT_COL}" \
             --label "${LABEL}"
 
-      - name: Upload artifacts (for debug)
+      - name: Upload artifacts (debug)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rbank9_intraday_artifacts
+          name: rbank9_intraday_outputs
           path: |
-            ${{ env.SNAPSHOT_PNG }}
-            ${{ env.OUT_TEXT }}
-            ${{ env.OUT_JSON }}
-          if-no-files-found: ignore
+            ${OUT_JSON}
+            ${OUT_TEXT}
+            ${SNAPSHOT_PNG}
+          if-no-files-found: error
           retention-days: 3
 
-      # ✅ 修正版：変数展開を正しく修復済み
-      - name: Checkout Sakura-Index-Site (for publishing)
+      # ==== ここからサイトへの公開 ====
+
+      - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
-          repository: "${{ env.SITE_OWNER }}/${{ env.SITE_REPO }}"
+          repository: ${{ env.SITE_REPO }}
           ref: ${{ env.SITE_BRANCH }}
-          token: ${{ secrets.SITE_PAT }}
-          path: SakuraIndexSite
+          token: ${{ secrets.SITE_PAT }}   # ← 各指数リポに登録した PAT
           fetch-depth: 0
+          path: site
 
-      - name: Publish ${INDEX_KEY} snapshot to site
-        run: |
-          set -euo pipefail
-          DEST="SakuraIndexSite/${SITE_SUBDIR}/${INDEX_KEY}"
-          mkdir -p "${DEST}"
-          cp -f "${SNAPSHOT_PNG}" "${DEST}/intraday.png"
-          cp -f "${OUT_TEXT}"     "${DEST}/post_intraday.txt"
-          cp -f "${OUT_JSON}"     "${DEST}/stats.json"
-          echo "✅ Updated: ${DEST}"
-
-      - name: Commit & push site charts
+      - name: Copy snapshot files into site tree
         run: |
           set -e
-          cd SakuraIndexSite
+          mkdir -p "site/${SITE_PATH}"
+          cp "${OUT_JSON}"    "site/${SITE_PATH}/"
+          cp "${OUT_TEXT}"    "site/${SITE_PATH}/"
+          cp "${SNAPSHOT_PNG}" "site/${SITE_PATH}/"
+
+      - name: Commit & push to site
+        run: |
+          set -e
+          cd site
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${SITE_SUBDIR}/${INDEX_KEY}/" || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(${INDEX_KEY}): publish intraday snapshot"
-            git push origin "${SITE_BRANCH}"
+          git add "${SITE_PATH}/"
+          if git diff --cached --quiet; then
+            echo "No site changes."
           else
-            echo "No changes to commit."
+            msg="publish(${ENV_INDEX_KEY:-$INDEX_KEY}): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git commit -m "$msg"
+            git push origin "${SITE_BRANCH}"
           fi
