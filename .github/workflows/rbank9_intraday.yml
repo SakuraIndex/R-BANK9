@@ -1,7 +1,7 @@
 name: R-BANK9 • intraday snapshot (JST 09:00–15:30)
 
 on:
-  # ← 手動ディスパッチ（Run workflow ボタン用）
+  # 手動実行（Run workflow ボタンを確実に表示）
   workflow_dispatch:
     inputs:
       session_start:
@@ -17,15 +17,15 @@ on:
         required: true
         default: "09:00"
       basis:
-        description: "Return basis label"
+        description: "Return basis label: prev_close"
         required: true
         default: "prev_close"
+      # R-BANK9 は CSV 側が「百分率」で来る想定（例: 1.23）。二重掛け防止で percent を固定
       value_type:
-        description: "Value type: percent | ratio （percent推奨）"
+        description: "Value type (fixed): percent"
         required: true
         default: "percent"
-
-  # ← 自動スケジュール（JST 11:35 / 15:35）※平日
+  # 自動実行（JST 11:35 / 15:35）※GitHub cron は UTC なので +9h 引いた時刻
   schedule:
     - cron: "35 2 * * 1-5"   # 11:35 JST
     - cron: "35 6 * * 1-5"   # 15:35 JST
@@ -33,6 +33,7 @@ on:
 permissions:
   contents: write
 
+# 同時実行を抑止（push/手動/cron が重なっても上書き運用）
 concurrency:
   group: rbank9-intraday-${{ github.ref }}
   cancel-in-progress: false
@@ -41,13 +42,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TZ: Asia/Tokyo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: true  # Commit/PUSH できるように
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -63,13 +66,9 @@ jobs:
         run: |
           test -f scripts/make_intraday_post.py || (echo "Missing scripts/make_intraday_post.py" && exit 2)
           test -f docs/outputs/rbank9_intraday.csv || (echo "Missing docs/outputs/rbank9_intraday.csv" && exit 2)
-
-          # 入力バリデーション（手動時）
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            [[ "${{ inputs.session_start }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
-            [[ "${{ inputs.session_end }}"   =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
-            [[ "${{ inputs.day_anchor }}"    =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
-          fi
+          [[ "${{ github.event.inputs.session_start || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_start invalid"; exit 2)
+          [[ "${{ github.event.inputs.session_end   || '15:30' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "session_end invalid";   exit 2)
+          [[ "${{ github.event.inputs.day_anchor    || '09:00' }}" =~ ^[0-9]{2}:[0-9]{2}$ ]] || (echo "day_anchor invalid";    exit 2)
 
       - name: Generate intraday post and snapshot
         env:
@@ -78,16 +77,21 @@ jobs:
           OUT_JSON: docs/outputs/rbank9_stats.json
           OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
           SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-          SESSION_START: ${{ github.event_name == 'workflow_dispatch' && inputs.session_start || '09:00' }}
-          SESSION_END:   ${{ github.event_name == 'workflow_dispatch' && inputs.session_end   || '15:30' }}
-          DAY_ANCHOR:    ${{ github.event_name == 'workflow_dispatch' && inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ github.event_name == 'workflow_dispatch' && inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ github.event_name == 'workflow_dispatch' && inputs.value_type    || 'percent' }}
+
+          # 入力（手動 or 既定）
+          SESSION_START: ${{ github.event.inputs.session_start || '09:00' }}
+          SESSION_END:   ${{ github.event.inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ github.event.inputs.day_anchor    || '09:00' }}
+          BASIS:         ${{ github.event.inputs.basis         || 'prev_close' }}
+          # ← R-BANK9 は percent 固定（CSVが “1.23%” の 1.23 などの場合に正しく表示）
+          VALUE_TYPE:    ${{ github.event.inputs.value_type    || 'percent' }}
+
+          # R-BANK9 の intraday CSV は index 列が Unnamed: 0 の想定
           DT_COL:        Unnamed: 0
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
-          echo "=== Intraday snapshot (R–BANK9) ==="
+          echo "=== Intraday snapshot (R-BANK9) ==="
           echo "CSV file: ${CSV}"
           echo "Datetime column: ${DT_COL}"
 
