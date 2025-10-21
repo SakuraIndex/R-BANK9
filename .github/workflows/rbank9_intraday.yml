@@ -22,7 +22,7 @@ on:
       value_type:
         description: "Value type: ratio | percent"
         required: true
-        default: "percent"  # ←★ここを ratio→percent に固定（常時percentで動作）
+        default: "percent"   # ← 既定を percent に固定
 
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
@@ -75,13 +75,14 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ inputs.value_type || 'percent' }}  # ←ここでも確実にpercent固定
-          DT_COL:        "Unnamed: 0"  # コロンを含むためクォート必須
+          VALUE_TYPE:    ${{ inputs.value_type    || 'percent' }}  # ← 既定 percent
+          CSV_UNIT:      percent  # ← R-BANK9 の CSV は％値なので明示
+          DT_COL:        "Unnamed: 0"
           LABEL:         R-BANK9
         run: |
           set -euo pipefail
           echo "=== Generate R-BANK9 intraday snapshot ==="
-          echo "VALUE_TYPE=${VALUE_TYPE:-<empty>}"
+          echo "VALUE_TYPE=${VALUE_TYPE} (default=percent)"
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -93,6 +94,7 @@ jobs:
             --day-anchor "${DAY_ANCHOR}" \
             --basis "${BASIS}" \
             --value-type "${VALUE_TYPE}" \
+            --csv-unit "${CSV_UNIT}" \
             --dt-col "${DT_COL}" \
             --label "${LABEL}"
 
@@ -111,8 +113,14 @@ jobs:
       - name: Commit outputs if changed
         run: |
           set -e
-          git config --global user.name  "github-actions[bot]"
+          git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore(intraday): update R-BANK9 (snapshot & post)" || true
-          git push || true
+          git add docs/outputs/rbank9_intraday.png \
+                  docs/outputs/rbank9_post_intraday.txt \
+                  docs/outputs/rbank9_stats.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(intraday): update R-BANK9 (snapshot & post)"
+            git push
+          else
+            echo "No output changes detected."
+          fi
