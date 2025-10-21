@@ -20,16 +20,20 @@ on:
         required: true
         default: "prev_close"
       value_type:
-        description: "Value type: ratio | percent"
-        required: true
-        default: "ratio"
-
+        description: "Value type: ratio | percent (override default)"
+        required: false
+        default: ""
   schedule:
     - cron: "35 2 * * 1-5"   # JST 11:35
     - cron: "35 6 * * 1-5"   # JST 15:35
 
 permissions:
   contents: write
+
+# ここで「既定の値」を一元管理（必要なら repo Variables に切替も可）
+# 例: vars.RBANK9_VALUE_TYPE を作成してあれば、下行を env: { DEFAULT_VALUE_TYPE: ${{ vars.RBANK9_VALUE_TYPE }} } に。
+env:
+  DEFAULT_VALUE_TYPE: percent
 
 concurrency:
   group: rbank9-intraday-${{ github.ref }}
@@ -72,15 +76,17 @@ jobs:
           OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
           SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
           SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END: ${{ inputs.session_end || '15:30' }}
-          DAY_ANCHOR: ${{ inputs.day_anchor || '09:00' }}
-          BASIS: ${{ inputs.basis || 'prev_close' }}
-          VALUE_TYPE: ${{ inputs.value_type || 'ratio' }}
-          DT_COL: "Unnamed: 0"   # ← コロンを含むため必ずクォート
+          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
+          BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          # ここが肝心：手動実行で値が入ればそれを採用、なければ DEFAULT_VALUE_TYPE（=percent）
+          VALUE_TYPE:    ${{ (inputs.value_type && inputs.value_type != '' && inputs.value_type) || env.DEFAULT_VALUE_TYPE }}
+          DT_COL: "Unnamed: 0"     # ← コロンを含むので必ずクォート
           LABEL: R-BANK9
         run: |
           set -euo pipefail
           echo "=== Generate R-BANK9 intraday snapshot ==="
+          echo "VALUE_TYPE=${VALUE_TYPE} (default=${DEFAULT_VALUE_TYPE})"
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
