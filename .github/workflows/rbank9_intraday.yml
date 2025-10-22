@@ -28,13 +28,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # === 固定値（ここが誤っていると checkout に失敗します）===
-  SITE_REPO: SakuraIndex/SakuraIndexSite   # ← ハイフン無しの正しい名前
+  # === 公開サイトの正しいリポ名（固定）===
+  SITE_REPO: SakuraIndex/SakuraIndexSite
   SITE_BRANCH: main
-  # サイト側に置くパス（必要に応じて変更）
   SITE_PATH: charts/rbank9
 
-  # 生成物のキーと入出力
+  # 生成物
   INDEX_KEY: R_BANK9
   CSV: docs/outputs/rbank9_intraday.csv
   OUT_JSON: docs/outputs/rbank9_stats.json
@@ -69,29 +68,29 @@ jobs:
       - name: Verify inputs
         run: |
           test -f scripts/make_intraday_post.py
-          test -f "${CSV}"
+          test -f "${{ env.CSV }}"
 
       - name: Generate intraday snapshot & post
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
-          SESSION_END: ${{ inputs.session_end || '15:30' }}
-          DAY_ANCHOR: ${{ inputs.day_anchor || '09:00' }}
+          SESSION_END:   ${{ inputs.session_end   || '15:30' }}
+          DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
         run: |
           set -euo pipefail
-          echo "=== Generate ${INDEX_KEY} intraday snapshot ==="
+          echo "=== Generate $INDEX_KEY intraday snapshot ==="
           python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${SNAPSHOT_PNG}" \
-            --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --basis "${BASIS}" \
-            --value-type "${VALUE_TYPE}" \
-            --dt-col "${DT_COL}" \
-            --label "${LABEL}"
+            --index-key "$INDEX_KEY" \
+            --csv "$CSV" \
+            --out-json "$OUT_JSON" \
+            --out-text "$OUT_TEXT" \
+            --snapshot-png "$SNAPSHOT_PNG" \
+            --session-start "$SESSION_START" \
+            --session-end "$SESSION_END" \
+            --day-anchor "$DAY_ANCHOR" \
+            --basis "$BASIS" \
+            --value-type "$VALUE_TYPE" \
+            --dt-col "$DT_COL" \
+            --label "$LABEL"
 
       - name: Upload artifacts (debug)
         if: always()
@@ -99,20 +98,19 @@ jobs:
         with:
           name: rbank9_intraday_outputs
           path: |
-            ${OUT_JSON}
-            ${OUT_TEXT}
-            ${SNAPSHOT_PNG}
-          if-no-files-found: error
+            ${{ env.OUT_JSON }}
+            ${{ env.OUT_TEXT }}
+            ${{ env.SNAPSHOT_PNG }}
+          if-no-files-found: warn      # ← ここを warn/ignore にすることでジョブが落ちない
           retention-days: 3
 
-      # ==== ここからサイトへの公開 ====
-
+      # ==== ここからサイトへ公開 ====
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SITE_REPO }}
           ref: ${{ env.SITE_BRANCH }}
-          token: ${{ secrets.SITE_PAT }}   # ← 各指数リポに登録した PAT
+          token: ${{ secrets.SITE_PAT }}  # 各指数リポに登録した PAT
           fetch-depth: 0
           path: site
 
@@ -120,9 +118,9 @@ jobs:
         run: |
           set -e
           mkdir -p "site/${SITE_PATH}"
-          cp "${OUT_JSON}"    "site/${SITE_PATH}/"
-          cp "${OUT_TEXT}"    "site/${SITE_PATH}/"
-          cp "${SNAPSHOT_PNG}" "site/${SITE_PATH}/"
+          cp "${{ env.OUT_JSON }}"     "site/${SITE_PATH}/"
+          cp "${{ env.OUT_TEXT }}"     "site/${SITE_PATH}/"
+          cp "${{ env.SNAPSHOT_PNG }}" "site/${SITE_PATH}/"
 
       - name: Commit & push to site
         run: |
@@ -134,7 +132,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No site changes."
           else
-            msg="publish(${ENV_INDEX_KEY:-$INDEX_KEY}): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git commit -m "$msg"
+            git commit -m "publish(${INDEX_KEY}): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push origin "${SITE_BRANCH}"
           fi
