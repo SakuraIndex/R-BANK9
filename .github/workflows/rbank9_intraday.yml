@@ -3,66 +3,89 @@ name: R-BANK9 • intraday + publish (JST 09:00–15:30)
 on:
   workflow_dispatch:
     inputs:
-      session_start: { description: "Session start (HH:MM JST)", required: true, default: "09:00" }
-      session_end:   { description: "Session end (HH:MM JST)",   required: true, default: "15:30" }
-      day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
-      basis:         { description: "Return basis label", required: true, default: "prev_close" }
-      value_type:    { description: "Value type: ratio | percent", required: true, default: "percent" }
-  schedule:
-    - cron: "35 2 * * 1-5"
-    - cron: "35 6 * * 1-5"
+      session_start:
+        description: "Session start (HH:MM JST)"
+        required: true
+        default: "09:00"
+      session_end:
+        description: "Session end (HH:MM JST)"
+        required: true
+        default: "15:30"
+      day_anchor:
+        description: "Day anchor time (HH:MM JST)"
+        required: true
+        default: "09:00"
+      basis:
+        description: "Return basis label"
+        required: true
+        default: "prev_close"
+      value_type:
+        description: "ratio | percent (override default)"
+        required: false
+        default: ""
+  # （必要なら平日定期実行を有効化）
+  # schedule:
+  #   - cron: "*/15 0-6 * * 1-5" # JST 09:00-15:30 相当（例）
 
 permissions:
   contents: write
 
 env:
-  INDEX_KEY: R-BANK9
+  # ★ 指数ごと固有値
+  INDEX_KEY: R_BANK9
   LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
-  OUT_JSON: docs/outputs/rbank9_stats.json
-  OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
-  SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-  DT_COL: "Unnamed: 0"
+  DT_COL: "Datetime"           # CSV の日時列名（必要に応じて調整）
+  # ★ サイト側設定
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
-  PUBLISH_DIR: charts/${{ env.INDEX_KEY }}
+  PUBLISH_DIR: charts/R-BANK9
+  # 既定：percent（入力で空なら percent を使う）
+  VALUE_TYPE_DEFAULT: percent
 
 concurrency:
-  group: intraday-${{ github.ref }}-${{ env.INDEX_KEY }}
+  group: intraday-${{ github.ref }}--R-BANK9
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
+          set -e
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Verify inputs & files
         run: |
           set -e
-          test -f scripts/make_intraday_post.py
-          test -f "${CSV}"
+          test -f "${CSV}" || (echo "Missing CSV: ${CSV}" && exit 1)
+          test -f scripts/make_intraday_post.py || (echo "Missing script: scripts/make_intraday_post.py" && exit 1)
 
       - name: Decide publish variant (AM / PM)
+        id: ampm
         shell: bash
-        env: { RUN_SCHEDULE: ${{ github.event.schedule }} }
         run: |
-          if [[ "${RUN_SCHEDULE}" == "35 2 * * 1-5" ]]; then
-            echo "PUBLISH_VARIANT=am" >> "$GITHUB_ENV"
+          # 09:00〜12:00 を AM、12:00 以降を PM の目安に
+          H=$(TZ=Asia/Tokyo date +%H)
+          if [ "$H" -lt 12 ]; then
+            echo "variant=am" >> "$GITHUB_OUTPUT"
           else
-            echo "PUBLISH_VARIANT=pm" >> "$GITHUB_ENV"
+            echo "variant=pm" >> "$GITHUB_OUTPUT"
           fi
-          echo "VALUE_TYPE=${{ inputs.value_type || 'percent' }}" >> "$GITHUB_ENV"
 
       - name: Generate intraday snapshot and post
         env:
@@ -70,9 +93,24 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
-          VALUE_TYPE:    ${{ env.VALUE_TYPE }}
+          VALUE_TYPE_IN: ${{ inputs.value_type    || '' }}
         run: |
           set -euo pipefail
+
+          # ===== 出力先（index リポ側） =====
+          OUT_JSON="docs/outputs/rbank9_stats.json"
+          OUT_TEXT="docs/outputs/rbank9_post_intraday.txt"
+          SNAPSHOT_PNG="docs/outputs/rbank9_intraday.png"
+          mkdir -p docs/outputs
+
+          # value_type: 入力が空なら percent を既定に
+          VALUE_TYPE="${VALUE_TYPE_IN}"
+          if [ -z "${VALUE_TYPE}" ]; then VALUE_TYPE="${VALUE_TYPE_DEFAULT}"; fi
+
+          echo "=== Generate ${LABEL} intraday snapshot ==="
+          echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
+
+          # 実生成
           python scripts/make_intraday_post.py \
             --index-key "${INDEX_KEY}" \
             --csv "${CSV}" \
@@ -80,25 +118,28 @@ jobs:
             --out-text "${OUT_TEXT}" \
             --snapshot-png "${SNAPSHOT_PNG}" \
             --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --basis "${BASIS}" \
-            --value-type "${VALUE_TYPE}" \
-            --dt-col "${DT_COL}" \
-            --label "${LABEL}"
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --basis         "${BASIS}" \
+            --label         "${LABEL}" \
+            --dt-col        "${DT_COL}" \
+            --value-type    "${VALUE_TYPE}"
 
-      - name: Upload artifacts (debug)
-        if: always()
+          echo "---- generated files ----"
+          ls -l "${OUT_JSON}" "${OUT_TEXT}" "${SNAPSHOT_PNG}"
+
+      # デバッグ artifact は不要なら完全無効化（黄色 Warning を出さない）
+      - name: Upload artifacts (for debug)
+        if: false
         uses: actions/upload-artifact@v4
         with:
           name: rbank9_intraday_artifacts
           path: |
-            ${OUT_TEXT}
-            ${OUT_JSON}
-            ${SNAPSHOT_PNG}
-          if-no-files-found: ignore
-          retention-days: 3
+            docs/outputs/rbank9_stats.json
+            docs/outputs/rbank9_post_intraday.txt
+            docs/outputs/rbank9_intraday.png
 
+      # 以降、サイト側へ公開
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
@@ -107,34 +148,23 @@ jobs:
           ref: ${{ env.SITE_BRANCH }}
           path: site
 
-      - name: Copy snapshot files into site tree (with AM/PM & long-term)
+      - name: Copy snapshot files into site tree
         run: |
           set -e
           mkdir -p "site/${PUBLISH_DIR}"
-
-          if [ "${PUBLISH_VARIANT}" = "am" ]; then
-            cp -f "${SNAPSHOT_PNG}" "site/${PUBLISH_DIR}/intraday_am.png"
-          else
-            cp -f "${SNAPSHOT_PNG}" "site/${PUBLISH_DIR}/intraday.png"
-          fi
-
-          for T in 7d 1m 1y; do
-            F="docs/outputs/rbank9_${T}.png"
-            if [ -f "${F}" ]; then
-              cp -f "${F}" "site/${PUBLISH_DIR}/${T}.png"
-            fi
-          done
+          cp -f docs/outputs/rbank9_intraday.png "site/${PUBLISH_DIR}/intraday.png"
+          cp -f docs/outputs/rbank9_stats.json   "site/${PUBLISH_DIR}/stats.json"
 
       - name: Commit & push site charts
         working-directory: site
         run: |
           set -e
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${PUBLISH_DIR}" || true
-          if ! git diff --cached --quiet; then
-            git commit -m "publish(${ {env.INDEX_KEY} }): intraday ${PUBLISH_VARIANT}"
-            git push origin "${SITE_BRANCH}"
-          else
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${PUBLISH_DIR}/intraday.png" "${PUBLISH_DIR}/stats.json"
+          if git diff --cached --quiet; then
             echo "No site changes."
+            exit 0
           fi
+          git commit -m "chore(site): update R-BANK9 intraday snapshot & stats"
+          git push origin "${SITE_BRANCH}"
