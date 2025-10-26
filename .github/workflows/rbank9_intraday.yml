@@ -19,7 +19,11 @@ on:
         description: "Return basis label"
         required: true
         default: "prev_close"
-  # 必要なら平日定期実行を有効化
+      value_type:
+        description: "ratio | percent (override default)"
+        required: false
+        default: ""
+  # （必要なら平日定期実行を有効化）
   # schedule:
   #   - cron: "*/15 0-6 * * 1-5" # JST 09:00-15:30 相当（例）
 
@@ -31,15 +35,15 @@ env:
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
-  # 日時列は自動検出したいので空にしておく（CSVが Unnamed: 0 でもOK）
-  DT_COL: ""
-  # CSV は％値として扱う（ratio 推定のブレを防止）
-  CSV_UNIT: percent
+  DT_COL: "Datetime"           # CSV の日時列名（必要に応じて調整）
 
-  # ★ サイト側（公開先）
+  # ★ サイト側設定
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: charts/R-BANK9
+
+  # 既定：percent（入力で空なら percent を使う）
+  VALUE_TYPE_DEFAULT: percent
 
 concurrency:
   group: intraday-${{ github.ref }}--R-BANK9
@@ -77,6 +81,7 @@ jobs:
         id: ampm
         shell: bash
         run: |
+          # 09:00〜12:00 を AM、12:00 以降を PM の目安に
           H=$(TZ=Asia/Tokyo date +%H)
           if [ "$H" -lt 12 ]; then
             echo "variant=am" >> "$GITHUB_OUTPUT"
@@ -90,43 +95,58 @@ jobs:
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
           BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          VALUE_TYPE_IN: ${{ inputs.value_type    || '' }}
         run: |
           set -euo pipefail
 
-          # ===== 出力（このリポ内） =====
+          # ===== 出力先（index リポ側） =====
           OUT_JSON="docs/outputs/rbank9_stats.json"
           OUT_TEXT="docs/outputs/rbank9_post_intraday.txt"
           SNAPSHOT_PNG="docs/outputs/rbank9_intraday.png"
           mkdir -p docs/outputs
 
+          # value_type: 入力が空なら percent を既定に
+          VALUE_TYPE="${VALUE_TYPE_IN}"
+          if [ -z "${VALUE_TYPE}" ]; then VALUE_TYPE="${VALUE_TYPE_DEFAULT}"; fi
+
           echo "=== Generate ${LABEL} intraday snapshot ==="
-          echo "CSV_UNIT=${CSV_UNIT}"
+          echo "VALUE_TYPE=${VALUE_TYPE} (default=${VALUE_TYPE_DEFAULT})"
 
-          PY_ARGS=(
-            --index-key "${INDEX_KEY}"
-            --csv "${CSV}"
-            --out-json "${OUT_JSON}"
-            --out-text "${OUT_TEXT}"
-            --snapshot-png "${SNAPSHOT_PNG}"
-            --session-start "${SESSION_START}"
-            --session-end   "${SESSION_END}"
-            --day-anchor    "${DAY_ANCHOR}"
-            --basis         "${BASIS}"
-            --label         "${LABEL}"
-            --csv-unit      "${CSV_UNIT}"
-          )
-
-          # DT_COL が空でなければ渡す（空なら自動検出に任せる）
-          if [ -n "${DT_COL}" ]; then
-            PY_ARGS+=( --dt-col "${DT_COL}" )
-          fi
-
-          python scripts/make_intraday_post.py "${PY_ARGS[@]}"
+          # 実生成
+          python scripts/make_intraday_post.py \
+            --index-key "${INDEX_KEY}" \
+            --csv "${CSV}" \
+            --out-json "${OUT_JSON}" \
+            --out-text "${OUT_TEXT}" \
+            --snapshot-png "${SNAPSHOT_PNG}" \
+            --session-start "${SESSION_START}" \
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --basis         "${BASIS}" \
+            --label         "${LABEL}" \
+            --dt-col        "${DT_COL}" \
+            --value-type    "${VALUE_TYPE}"
 
           echo "---- generated files ----"
           ls -l "${OUT_JSON}" "${OUT_TEXT}" "${SNAPSHOT_PNG}"
 
-      # デバッグ artifact (任意)
+      # 🆕 追加：このリポにも生成物をコミットしておく
+      - name: Commit intraday artifacts to THIS repo (optional)
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/rbank9_intraday.png \
+                  docs/outputs/rbank9_stats.json \
+                  docs/outputs/rbank9_post_intraday.txt
+          if git diff --cached --quiet; then
+            echo "No local changes to commit (this repo)."
+            exit 0
+          fi
+          git commit -m "chore(intraday): update R-BANK9 intraday snapshot & stats"
+          git push origin "${GITHUB_REF_NAME:-main}"
+
+      # デバッグ artifact は不要なら完全無効化（黄色 Warning を出さない）
       - name: Upload artifacts (for debug)
         if: false
         uses: actions/upload-artifact@v4
@@ -137,7 +157,7 @@ jobs:
             docs/outputs/rbank9_post_intraday.txt
             docs/outputs/rbank9_intraday.png
 
-      # 以降、サイト側へ公開
+      # ====== サイト側へのデプロイ ======
       - name: Checkout site repo (for publishing)
         uses: actions/checkout@v4
         with:
