@@ -1,0 +1,81 @@
+name: Generate long-term charts (R-BANK9 1d/7d/1m/1y + stats)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '05 1 * * *'   # 毎日 10:05 JST
+
+permissions: { contents: write }
+
+concurrency:
+  group: long-charts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: true }
+
+      - name: Resolve INDEX_KEY & market
+        id: resolve
+        shell: bash
+        run: |
+          echo "INDEX_KEY=rbank9" | tee -a "$GITHUB_ENV"
+          echo "market_tz=Asia/Tokyo"       >> "$GITHUB_OUTPUT"
+          echo "session_start=09:00"        >> "$GITHUB_OUTPUT"
+          echo "session_end=15:30"          >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
+
+      - run: rm -rf scripts/__pycache__ || true
+
+      - name: Generate long-term charts
+        env:
+          INDEX_KEY: ${{ env.INDEX_KEY }}
+          MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
+          SESSION_START: ${{ steps.resolve.outputs.session_start }}
+          SESSION_END: ${{ steps.resolve.outputs.session_end }}
+        run: |
+          python scripts/long_charts.py
+          ls -lah docs/outputs || true
+
+      - name: Normalize legacy filenames
+        run: |
+          OUTDIR="docs/outputs"; shopt -s nullglob
+          for f in "$OUTDIR"/r_bank9_*; do
+            base="$(basename "$f")"; mv -f "$f" "$OUTDIR/${base/r_bank9_/rbank9_}"
+          done
+
+      - name: Sanity check - prefix
+        env: { INDEX_KEY: ${{ env.INDEX_KEY }} }
+        run: |
+          OUTDIR="docs/outputs"; shopt -s nullglob; err=0
+          for f in "$OUTDIR"/*; do
+            b="$(basename "$f")"; case "$b" in README.md|_last_run.txt) continue;; esac
+            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "❌ prefix mismatch: $b"; err=1; }
+          done
+          [ $err -eq 0 ] || exit 1
+          echo "✅ Prefix check passed."
+
+      - name: Commit charts if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/outputs/${{ env.INDEX_KEY }}_{1d,7d,1m,1y}.png 2>/dev/null || true
+          git add docs/outputs/*_stats.json 2>/dev/null || true
+          if git diff --cached --quiet; then echo "No changes"; else git commit -m "chore(charts): update long charts & stats (${{ env.INDEX_KEY }})"; git push; fi
