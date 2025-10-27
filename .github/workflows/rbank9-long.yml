@@ -31,9 +31,9 @@ jobs:
         id: resolve
         shell: bash
         run: |
-          echo "market_tz=Asia/Tokyo"    >> "$GITHUB_OUTPUT"
-          echo "session_start=09:00"     >> "$GITHUB_OUTPUT"
-          echo "session_end=15:30"       >> "$GITHUB_OUTPUT"
+          echo "market_tz=Asia/Tokyo" >> "$GITHUB_OUTPUT"
+          echo "session_start=09:00"  >> "$GITHUB_OUTPUT"
+          echo "session_end=15:30"    >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -79,17 +79,24 @@ jobs:
       - name: Generate long-term charts
         shell: bash
         env:
-          MARKET_TZ:    ${{ steps.resolve.outputs.market_tz }}
+          MARKET_TZ:     ${{ steps.resolve.outputs.market_tz }}
           SESSION_START: ${{ steps.resolve.outputs.session_start }}
           SESSION_END:   ${{ steps.resolve.outputs.session_end }}
         run: |
           set -euo pipefail
+
           echo "== BEFORE (docs/outputs) =="
           ls -lah docs/outputs || true
           echo "-- existing hashes --"
-          (cd docs/outputs && for f in *.png *.csv *.json 2>/dev/null; do
-            printf "%-22s " "$f"; sha256sum "$f" | awk '{print $1}'
-          done || true)
+          (
+            set -e
+            cd docs/outputs 2>/dev/null || exit 0
+            shopt -s nullglob
+            for f in *.png *.csv *.json; do
+              printf "%-22s " "$f"
+              sha256sum "$f" | awk '{print $1}'
+            done
+          )
 
           echo "== run long_charts.py =="
           python scripts/long_charts.py
@@ -97,9 +104,15 @@ jobs:
           echo "== AFTER (docs/outputs) =="
           ls -lah docs/outputs || true
           echo "-- hashes after generation --"
-          (cd docs/outputs && for f in *.png *.csv *.json 2>/dev/null; do
-            printf "%-22s " "$f"; sha256sum "$f" | awk '{print $1}'
-          done || true)
+          (
+            set -e
+            cd docs/outputs 2>/dev/null || exit 0
+            shopt -s nullglob
+            for f in *.png *.csv *.json; do
+              printf "%-22s " "$f"
+              sha256sum "$f" | awk '{print $1}'
+            done
+          )
 
       - name: Normalize legacy filenames
         shell: bash
@@ -141,7 +154,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 生成物はディレクトリごと add（取りこぼし防止）
+          # 取りこぼし防止でディレクトリごと add
           git add -A docs/outputs
 
           echo "== git status --porcelain =="
