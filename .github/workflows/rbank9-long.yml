@@ -21,7 +21,8 @@ jobs:
       INDEX_KEY: rbank9
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -30,14 +31,17 @@ jobs:
         id: resolve
         shell: bash
         run: |
-          echo "market_tz=Asia/Tokyo"       >> "$GITHUB_OUTPUT"
-          echo "session_start=09:00"        >> "$GITHUB_OUTPUT"
-          echo "session_end=15:30"          >> "$GITHUB_OUTPUT"
+          echo "market_tz=Asia/Tokyo"    >> "$GITHUB_OUTPUT"
+          echo "session_start=09:00"     >> "$GITHUB_OUTPUT"
+          echo "session_end=15:30"       >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - uses: actions/cache@v4
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -46,35 +50,69 @@ jobs:
       - name: Install deps
         shell: bash
         run: |
+          set -euo pipefail
+          python -V
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy matplotlib
+          fi
 
       - name: Clear pycache
         shell: bash
-        run: rm -rf scripts/__pycache__ || true
+        run: |
+          set -euo pipefail
+          rm -rf scripts/__pycache__ || true
 
       - name: Update history (if available)
         shell: bash
         run: |
-          if [ -f scripts/update_history.py ]; then python scripts/update_history.py || true; fi
+          set -euo pipefail
+          if [ -f scripts/update_history.py ]; then
+            echo "running scripts/update_history.py"
+            python scripts/update_history.py || true
+          else
+            echo "no scripts/update_history.py (skip)"
+          fi
 
       - name: Generate long-term charts
         shell: bash
         env:
-          MARKET_TZ: ${{ steps.resolve.outputs.market_tz }}
+          MARKET_TZ:    ${{ steps.resolve.outputs.market_tz }}
           SESSION_START: ${{ steps.resolve.outputs.session_start }}
-          SESSION_END: ${{ steps.resolve.outputs.session_end }}
+          SESSION_END:   ${{ steps.resolve.outputs.session_end }}
         run: |
-          set -e
-          python scripts/long_charts.py
+          set -euo pipefail
+          echo "== BEFORE (docs/outputs) =="
           ls -lah docs/outputs || true
+          echo "-- existing hashes --"
+          (cd docs/outputs && for f in *.png *.csv *.json 2>/dev/null; do
+            printf "%-22s " "$f"; sha256sum "$f" | awk '{print $1}'
+          done || true)
+
+          echo "== run long_charts.py =="
+          python scripts/long_charts.py
+
+          echo "== AFTER (docs/outputs) =="
+          ls -lah docs/outputs || true
+          echo "-- hashes after generation --"
+          (cd docs/outputs && for f in *.png *.csv *.json 2>/dev/null; do
+            printf "%-22s " "$f"; sha256sum "$f" | awk '{print $1}'
+          done || true)
 
       - name: Normalize legacy filenames
         shell: bash
         run: |
+          set -euo pipefail
           OUTDIR="docs/outputs"; shopt -s nullglob
           for f in "$OUTDIR"/r_bank9_*; do
-            base="$(basename "$f")"; mv -f "$f" "$OUTDIR/${base/r_bank9_/rbank9_}"
+            base="$(basename "$f")"
+            new="$OUTDIR/${base/r_bank9_/rbank9_}"
+            if [ "$f" != "$new" ]; then
+              mv -f "$f" "$new"
+              echo "rename: $base -> $(basename "$new")"
+            fi
           done
 
       - name: Sanity check - prefix
@@ -82,24 +120,35 @@ jobs:
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
+          set -euo pipefail
           OUTDIR="docs/outputs"; shopt -s nullglob; err=0
           for f in "$OUTDIR"/*; do
             b="$(basename "$f")"
-            case "$b" in README.md|_last_run.txt) continue;; esac
-            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "X prefix mismatch: $b"; err=1; }
+            case "$b" in README.md|_last_run.txt) continue ;; esac
+            if [[ "$b" != "${INDEX_KEY}_"* ]]; then
+              echo "❌ prefix mismatch: $b"; err=1
+            fi
           done
-          [ $err -eq 0 ] || exit 1
-          echo "✓ Prefix check passed."
+          if [ $err -ne 0 ]; then
+            echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"; exit 1
+          fi
+          echo "✅ Prefix check passed."
 
-      - name: Commit charts if changed
+      - name: Commit charts if changed (force-add outputs dir)
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/${INDEX_KEY}_{1d,7d,1m,1y}.png 2>/dev/null || true
-          git add docs/outputs/*_stats.json 2>/dev/null || true
+
+          # 生成物はディレクトリごと add（取りこぼし防止）
+          git add -A docs/outputs
+
+          echo "== git status --porcelain =="
+          git status --porcelain || true
+
           if git diff --cached --quiet; then
-            echo "No changes"
+            echo "No changes to commit."
           else
             git commit -m "chore(charts): update long charts & stats (${INDEX_KEY})"
             git push
