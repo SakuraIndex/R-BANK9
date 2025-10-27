@@ -54,7 +54,7 @@ def best_datetime_column(df: pd.DataFrame) -> str | None:
             if ok >= max(5, len(s)//4):  # enough valid
                 df[c] = s
                 return c
-    # 2) try-all: pick column with max valid datetimes within sane year
+    # 2) try-all: pick column with max valid datetimes
     best_c, best_ok = None, -1
     for c in df.columns:
         s = pd.to_datetime(df[c], errors="coerce", utc=False)
@@ -74,8 +74,7 @@ def best_value_column(df: pd.DataFrame, ts_col: str) -> str | None:
             cand.append((c, s.notna().sum()))
             df[c] = s
     if not cand: return None
-    # choose most-complete
-    cand.sort(key=lambda x: x[1], reverse=True)
+    cand.sort(key=lambda x: x[1], reverse=True)  # most complete
     return cand[0][0]
 
 def load_csv(csv_path: Path) -> pd.DataFrame:
@@ -92,16 +91,15 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
     if not val_col:
         print(f"[long] No numeric value column in {csv_path}"); return pd.DataFrame()
 
-    # finalize
     out = pd.DataFrame({
         "ts":  pd.to_datetime(df[ts_col], errors="coerce", utc=False),
         "val": pd.to_numeric(df[val_col], errors="coerce")
     }).dropna().sort_values("ts").reset_index(drop=True)
 
-    # drop duplicates by ts
+    # drop duplicate timestamps, keep the last
     out = out[~out["ts"].duplicated(keep="last")]
 
-    # sanity: restrict to reasonable years (2000-2100)
+    # reasonable years
     mask = (out["ts"].dt.year >= 2000) & (out["ts"].dt.year <= 2100)
     out = out.loc[mask].reset_index(drop=True)
 
@@ -153,12 +151,16 @@ def plot_one_span(dfp: pd.DataFrame, title: str, out_png: Path):
     ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
     ax.set_xlabel("Time", labelpad=10)
     ax.set_ylabel("Change (%)", labelpad=10)
-    ax.plot(dfp["ts"].values, dfp["pct"].values, linewidth=2.6)
+
+    # 明示的に線色を指定（ダーク背景で視認できるように）
+    ax.plot(dfp["ts"].values, dfp["pct"].values, linewidth=2.6, color="#ff615a")
+
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
     ax.yaxis.set_minor_locator(MaxNLocator(nbins=50))
+
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
