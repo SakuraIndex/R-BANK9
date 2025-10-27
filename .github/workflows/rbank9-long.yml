@@ -19,6 +19,7 @@ jobs:
 
     env:
       INDEX_KEY: rbank9
+      OUT_DIR: docs/outputs
 
     steps:
       - name: Checkout
@@ -27,13 +28,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Resolve INDEX_KEY & market
+      - name: Resolve market session (JST)
         id: resolve
         shell: bash
         run: |
-          echo "market_tz=Asia/Tokyo" >> "$GITHUB_OUTPUT"
-          echo "session_start=09:00"  >> "$GITHUB_OUTPUT"
-          echo "session_end=15:30"    >> "$GITHUB_OUTPUT"
+          echo "market_tz=Asia/Tokyo"    >> "$GITHUB_OUTPUT"
+          echo "session_start=09:00"     >> "$GITHUB_OUTPUT"
+          echo "session_end=15:30"       >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,7 +46,8 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         shell: bash
@@ -61,20 +63,27 @@ jobs:
 
       - name: Clear pycache
         shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf scripts/__pycache__ || true
+        run: rm -rf scripts/__pycache__ || true
 
       - name: Update history (if available)
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           if [ -f scripts/update_history.py ]; then
-            echo "running scripts/update_history.py"
+            echo "run: update_history.py"
             python scripts/update_history.py || true
           else
-            echo "no scripts/update_history.py (skip)"
+            echo "scripts/update_history.py not found (skip)"
           fi
+
+      - name: List BEFORE (hashes)
+        shell: bash
+        run: |
+          set -e
+          OUT="$OUT_DIR"
+          echo "== BEFORE =="
+          ls -lah "$OUT" || true
+          (cd "$OUT" && sha256sum rbank9_*.png 2>/dev/null || true)
 
       - name: Generate long-term charts
         shell: bash
@@ -83,82 +92,62 @@ jobs:
           SESSION_START: ${{ steps.resolve.outputs.session_start }}
           SESSION_END:   ${{ steps.resolve.outputs.session_end }}
         run: |
-          set -euo pipefail
-
-          echo "== BEFORE (docs/outputs) =="
-          ls -lah docs/outputs || true
-          echo "-- existing hashes --"
-          (
-            set -e
-            cd docs/outputs 2>/dev/null || exit 0
-            shopt -s nullglob
-            for f in *.png *.csv *.json; do
-              printf "%-22s " "$f"
-              sha256sum "$f" | awk '{print $1}'
-            done
-          )
-
-          echo "== run long_charts.py =="
+          set -e
+          echo "PWD=$(pwd)"
+          echo "INDEX_KEY=$INDEX_KEY  OUT_DIR=$OUT_DIR"
+          echo "---- sample csv heads ----"
+          for f in "$OUT_DIR"/*history.csv "$OUT_DIR"/*_1d.csv; do
+            [ -f "$f" ] && { echo ">> $f"; head -n 5 "$f"; echo; }
+          done
+          echo "---- run long_charts.py ----"
           python scripts/long_charts.py
+          echo "---- AFTER ls ----"
+          ls -lah "$OUT_DIR" || true
 
-          echo "== AFTER (docs/outputs) =="
-          ls -lah docs/outputs || true
-          echo "-- hashes after generation --"
-          (
-            set -e
-            cd docs/outputs 2>/dev/null || exit 0
-            shopt -s nullglob
-            for f in *.png *.csv *.json; do
-              printf "%-22s " "$f"
-              sha256sum "$f" | awk '{print $1}'
-            done
-          )
+      - name: List AFTER (hashes)
+        shell: bash
+        run: |
+          set -e
+          OUT="$OUT_DIR"
+          echo "== AFTER =="
+          (cd "$OUT" && sha256sum rbank9_*.png 2>/dev/null || true)
 
       - name: Normalize legacy filenames
         shell: bash
         run: |
-          set -euo pipefail
-          OUTDIR="docs/outputs"; shopt -s nullglob
+          set -e
+          OUTDIR="$OUT_DIR"; shopt -s nullglob
           for f in "$OUTDIR"/r_bank9_*; do
             base="$(basename "$f")"
-            new="$OUTDIR/${base/r_bank9_/rbank9_}"
-            if [ "$f" != "$new" ]; then
-              mv -f "$f" "$new"
-              echo "rename: $base -> $(basename "$new")"
-            fi
+            mv -f "$f" "$OUTDIR/${base/r_bank9_/rbank9_}"
           done
 
       - name: Sanity check - prefix
         shell: bash
-        env:
-          INDEX_KEY: ${{ env.INDEX_KEY }}
         run: |
-          set -euo pipefail
-          OUTDIR="docs/outputs"; shopt -s nullglob; err=0
+          set -e
+          OUTDIR="$OUT_DIR"; shopt -s nullglob; err=0
           for f in "$OUTDIR"/*; do
             b="$(basename "$f")"
-            case "$b" in README.md|_last_run.txt) continue ;; esac
-            if [[ "$b" != "${INDEX_KEY}_"* ]]; then
-              echo "❌ prefix mismatch: $b"; err=1
-            fi
+            case "$b" in README.md|_last_run.txt) continue;; esac
+            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "X prefix mismatch: $b"; err=1; }
           done
-          if [ $err -ne 0 ]; then
-            echo "Prefix mismatch (INDEX_KEY=$INDEX_KEY)"; exit 1
-          fi
-          echo "✅ Prefix check passed."
+          [ $err -eq 0 ] || exit 1
+          echo "✓ Prefix check passed."
 
       - name: Commit charts if changed (force-add outputs dir)
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global safe.directory "$(pwd)"
 
-          # 取りこぼし防止でディレクトリごと add
-          git add -A docs/outputs
+          # 取りこぼし防止：outputs を丸ごと stage
+          git add -A "$OUT_DIR"
 
-          echo "== git status --porcelain =="
-          git status --porcelain || true
+          echo "-- staged files --"
+          git diff --name-only --cached || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
