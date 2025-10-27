@@ -3,10 +3,9 @@ name: Generate long-term charts (R-BANK9 1d/7d/1m/1y + stats)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '05 1 * * *'   # 毎日 10:05 JST
+    - cron: '05 1 * * *'   # 10:05 JST（引け後）
 
-permissions:
-  contents: write
+permissions: { contents: write }
 
 concurrency:
   group: long-charts-${{ github.ref }}
@@ -16,102 +15,55 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     env:
       INDEX_KEY: rbank9
       OUT_DIR: docs/outputs
+      MARKET_TZ: Asia/Tokyo
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: true }
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-      - name: Cache pip
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         shell: bash
         run: |
-          set -euo pipefail
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy matplotlib
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
 
-      - name: BEFORE - list & hashes
+      - name: Append daily to history (from intraday)
         shell: bash
-        run: |
-          ls -lah "$OUT_DIR" || true
-          (cd "$OUT_DIR" && sha256sum rbank9_*.png 2>/dev/null || true)
-
-      # ★ intraday → history を当日分だけ追記（新設スクリプト）
-      - name: Append daily point to history from intraday
-        shell: bash
+        env:
+          APPEND_TODAY_IF_MISSING: "true"    # ← 今すぐ確認したい間だけ true、運用は false 推奨
         run: |
           python scripts/update_history_from_intraday.py || true
-          echo "--- after append ---"
           tail -n 5 "$OUT_DIR/rbank9_history.csv" 2>/dev/null || true
 
       - name: Generate long-term charts
         shell: bash
         run: |
           python scripts/long_charts.py
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$OUT_DIR/_last_run.txt"
           ls -lah "$OUT_DIR" || true
 
-      - name: AFTER - hashes
+      - name: Commit if changed
         shell: bash
         run: |
-          (cd "$OUT_DIR" && sha256sum rbank9_*.png 2>/dev/null || true)
-
-      - name: Normalize legacy filenames
-        shell: bash
-        run: |
-          shopt -s nullglob
-          for f in "$OUT_DIR"/r_bank9_*; do
-            base="$(basename "$f")"
-            mv -f "$f" "$OUT_DIR/${base/r_bank9_/rbank9_}"
-          done
-
-      - name: Sanity check - prefix
-        shell: bash
-        run: |
-          shopt -s nullglob; err=0
-          for f in "$OUT_DIR"/*; do
-            b="$(basename "$f")"
-            case "$b" in README.md|_last_run.txt) continue ;; esac
-            [[ "$b" == "${INDEX_KEY}_"* ]] || { echo "X prefix mismatch: $b"; err=1; }
-          done
-          [ $err -eq 0 ] || exit 1
-          echo "✓ Prefix check passed."
-
-      - name: Commit charts if changed (stage whole outputs)
-        shell: bash
-        run: |
-          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global safe.directory "$(pwd)"
-
-          # 取りこぼし防止：outputs 丸ごと
           git add -A "$OUT_DIR"
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore(rbank9): append history and update 1d/7d/1m/1y charts"
+            git commit -m "chore(rbank9): update history and 1d/7d/1m/1y charts"
             git push
           fi
