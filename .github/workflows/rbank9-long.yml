@@ -16,76 +16,48 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     env:
       INDEX_KEY: rbank9
       OUT_DIR: docs/outputs
       MARKET_TZ: Asia/Tokyo
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
-        shell: bash
         run: |
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy matplotlib
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas matplotlib; fi
 
-      # （任意）直近 intraday から history に未収録の1日分を追記する補助スクリプト
-      # 無ければ何もしません。運用では false 推奨。
-      - name: Append daily to history (optional)
-        shell: bash
-        env:
-          APPEND_TODAY_IF_MISSING: "false"
-        run: |
-          python scripts/update_history_from_intraday.py 2>/dev/null || true
-          tail -n 5 "$OUT_DIR/${INDEX_KEY}_history.csv" 2>/dev/null || true
-
-      - name: Generate long-term charts (7d/1m/1y)
-        shell: bash
+      # 履歴ファイルは外部ワークフロー等で蓄積していく前提
+      # ここでは存在チェックのみ（無ければ空のままグラフは「Insufficient history」表示）
+      - name: Generate long-term charts
         run: |
           python scripts/long_charts.py
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > "$OUT_DIR/_last_run.txt"
           ls -lah "$OUT_DIR" || true
 
-      - name: Commit if changed (exclude 1d)
-        shell: bash
+      - name: Commit if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global safe.directory "$(pwd)"
-
-          # 1d はステージしない。必要な成果物だけ add
-          git add "$OUT_DIR/${INDEX_KEY}_7d.png" 2>/dev/null || true
-          git add "$OUT_DIR/${INDEX_KEY}_1m.png" 2>/dev/null || true
-          git add "$OUT_DIR/${INDEX_KEY}_1y.png" 2>/dev/null || true
-          git add "$OUT_DIR/${INDEX_KEY}_history.csv" 2>/dev/null || true
-          git add "$OUT_DIR/${INDEX_KEY}_stats.json" 2>/dev/null || true
-          git add "$OUT_DIR/_last_run.txt" 2>/dev/null || true
-
+          git add "$OUT_DIR"/rbank9_{7d,1m,1y}.png "$OUT_DIR"/_last_run.txt 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore(${INDEX_KEY}): update history and long-term charts (7d/1m/1y) + stats"
+            git commit -m "chore(rbank9): update long-term charts (7d/1m/1y)"
             git push
           fi
