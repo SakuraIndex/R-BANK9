@@ -1,9 +1,9 @@
-name: Generate long-term charts (R-BANK9 7d/1m/1y + stats)
+name: Generate long-term charts (R-BANK9 7d/1m/1y)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '05 1 * * *'   # 10:05 JST（引け後）
+    - cron: '05 1 * * *'     # 10:05 JST
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,50 +13,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  long:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       INDEX_KEY: rbank9
       OUT_DIR: docs/outputs
-      MARKET_TZ: Asia/Tokyo
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+        with: { fetch-depth: 0, persist-credentials: true }
 
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+        with: { python-version: "3.11" }
 
       - name: Install deps
-        run: |
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas matplotlib; fi
+        run: pip install --upgrade pip && pip install pandas matplotlib
 
-      # 履歴ファイルは外部ワークフロー等で蓄積していく前提
-      # ここでは存在チェックのみ（無ければ空のままグラフは「Insufficient history」表示）
-      - name: Generate long-term charts
+      - name: Generate 7d/1m/1y charts
         run: |
           python scripts/long_charts.py
           ls -lah "$OUT_DIR" || true
 
-      - name: Commit if changed
+      - name: Commit charts
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global safe.directory "$(pwd)"
-          git add "$OUT_DIR"/rbank9_{7d,1m,1y}.png "$OUT_DIR"/_last_run.txt 2>/dev/null || true
+          git add "$OUT_DIR"/rbank9_{7d,1m,1y}.png "$OUT_DIR"/_last_run.txt
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No chart updates."
           else
             git commit -m "chore(rbank9): update long-term charts (7d/1m/1y)"
             git push
