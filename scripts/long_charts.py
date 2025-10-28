@@ -1,213 +1,187 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+R-BANK9 long-term charts (7d / 1m / 1y)
+- 1d(当日)の生成は行いません（Intraday ワークフローが担当）
+- 入力は docs/outputs/rbank9_history.csv を最優先で使用
+- 列名が不定でも自動検出し、NaN/重複/同値レンジを安全に処理
+- 変動が極端に小さくても線が見えるように y 軸に自動パディング
+"""
+
+from __future__ import annotations
 import os
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from matplotlib.dates import AutoDateLocator, AutoDateFormatter
-from datetime import datetime, timezone
 
 INDEX_KEY = os.environ.get("INDEX_KEY", "rbank9")
 OUT_DIR   = Path(os.environ.get("OUT_DIR", "docs/outputs"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===== params =====
-EPS = 1e-9        # ほぼゼロ除算回避
-USE_CLAMP = False # True なら下の CLAMP_PCT を使用
-CLAMP_PCT = 60.0
-
-def diag(msg: str):
+# ──────────────────────────────────────────────────────────────────────
+#  Logging (控えめに)
+def log(msg: str) -> None:
     print(f"[long] {msg}", flush=True)
 
-# ===== styling =====
-def apply_dark_theme(fig, ax):
+# ──────────────────────────────────────────────────────────────────────
+# ダークテーマ（見やすいコントラスト）
+def apply_dark(ax, title: str, y_label: str):
+    fig = ax.figure
     fig.set_size_inches(16, 8)
-    fig.set_dpi(200)
-    fig.patch.set_facecolor("#111317")
-    ax.set_facecolor("#111317")
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-    ax.tick_params(axis="both", colors="#ffffff", labelsize=10)
-    ax.yaxis.label.set_color("#ffffff")
-    ax.xaxis.label.set_color("#ffffff")
-    ax.title.set_color("#ffffff")
-    ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.18, color="#ffffff")
-    ax.grid(True, which="minor", linestyle="-", linewidth=0.4, alpha=0.10, color="#ffffff")
+    fig.set_dpi(160)
 
-# ===== data pickers =====
-def pick_csv_for_span(span: str) -> Path | None:
-    """ spanごとの優先データ源を返す """
-    intraday = OUT_DIR / f"{INDEX_KEY}_intraday.csv"
-    history  = OUT_DIR / f"{INDEX_KEY}_history.csv"
-    one      = OUT_DIR / f"{INDEX_KEY}_1d.csv"
+    bg = "#111317"
+    fg = "#e8eef7"
+    grid = "#2a2e3a"
 
-    if span == "1d":
-        if intraday.exists(): return intraday
-        if one.exists():      return one
-        if history.exists():  return history
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    for s in ax.spines.values():
+        s.set_visible(False)
+
+    ax.grid(True, which="major", linestyle="-", linewidth=0.8, color=grid, alpha=0.5)
+    ax.grid(True, which="minor", linestyle="-", linewidth=0.5, color=grid, alpha=0.25)
+
+    ax.tick_params(axis="both", colors=fg, labelsize=10)
+    ax.yaxis.label.set_color(fg)
+    ax.xaxis.label.set_color(fg)
+    ax.title.set_color(fg)
+
+    ax.set_title(title, fontsize=24, fontweight="bold", pad=18)
+    ax.set_xlabel("Time", labelpad=10)
+    ax.set_ylabel(y_label, labelpad=10)
+
+# ──────────────────────────────────────────────────────────────────────
+# 入力読み込み（history 優先）
+def _pick_numeric_col(df: pd.DataFrame) -> str | None:
+    # “値”らしい列を自動で選ぶ
+    candidates = []
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        non_na = s.notna().sum()
+        if non_na >= max(3, len(s)//5):  # 有効値が十分にある
+            candidates.append((c, non_na))
+    if not candidates:
         return None
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
 
-    # 7d/1m/1y
-    if history.exists():  return history
-    if intraday.exists(): return intraday
-    if one.exists():      return one
-    return None
+def load_history() -> pd.DataFrame:
+    # 優先: history.csv, 予備: intraday.csv（足りない時）
+    hist = OUT_DIR / f"{INDEX_KEY}_history.csv"
+    intra = OUT_DIR / f"{INDEX_KEY}_intraday.csv"
 
-def _coerce_datetime(s: pd.Series) -> pd.Series:
-    # 文字列/数値どちらでも頑張って時刻にする
-    ts = pd.to_datetime(s, errors="coerce", utc=False)
-    # もし全滅なら、UNIX秒/ミリ秒を疑って数値化→再トライ
-    if ts.notna().sum() == 0:
-        num = pd.to_numeric(s, errors="coerce")
-        ts = pd.to_datetime(num, errors="coerce", unit="s")
-        if ts.notna().sum() == 0:
-            ts = pd.to_datetime(num, errors="coerce", unit="ms")
-    return ts
-
-def load_csv_any(csv_path: Path) -> pd.DataFrame:
-    """1列目=時刻、2列目=値 という一般形/未知ヘッダでも動くロバストローダー"""
-    if not csv_path or not csv_path.exists():
-        return pd.DataFrame()
-    df_raw = pd.read_csv(csv_path)
-    if df_raw.empty or df_raw.shape[1] < 2:
+    if hist.exists():
+        df = pd.read_csv(hist, parse_dates=[0], index_col=0)
+        src = hist.name
+    elif intra.exists():
+        df = pd.read_csv(intra, parse_dates=[0], index_col=0)
+        src = intra.name
+    else:
+        log("no csv found (history/intraday).")
         return pd.DataFrame()
 
-    # 時刻列を探す（ts/time/timestamp/…優先 → 先頭列）
-    low = [c.lower().strip() for c in df_raw.columns]
-    ts_candidates = []
-    for pref in ("ts", "time", "timestamp", "date", "datetime"):
-        if pref in low:
-            ts_candidates.append(df_raw.columns[low.index(pref)])
-    if not ts_candidates:
-        ts_candidates = [df_raw.columns[0]]
-
-    ts = _coerce_datetime(df_raw[ts_candidates[0]])
-
-    # 値列を決める：ts列以外から NaN 以外が多い列
-    val_col = None
-    best_ok = -1
-    for c in df_raw.columns:
-        if c == ts_candidates[0]:
-            continue
-        v = pd.to_numeric(df_raw[c], errors="coerce")
-        ok = v.notna().sum()
-        if ok > best_ok:
-            best_ok = ok
-            val_col = c
-    if val_col is None:
+    # 最も “値” らしい列を 1 つ選ぶ
+    col = _pick_numeric_col(df)
+    if not col:
+        log(f"no numeric column found in {src}")
         return pd.DataFrame()
 
-    val = pd.to_numeric(df_raw[val_col], errors="coerce")
-    df = pd.DataFrame({"ts": ts, "val": val}).dropna().sort_values("ts")
-    # 年の異常値を除去
-    df = df[(df["ts"].dt.year >= 2000) & (df["ts"].dt.year <= 2100)]
-    df = df[~df["ts"].duplicated(keep="last")].reset_index(drop=True)
+    s = pd.to_numeric(df[col], errors="coerce")
+    s.index = pd.to_datetime(df.index, errors="coerce")
 
-    return df
+    # クレンジング
+    s = s.dropna()
+    s = s[~s.index.duplicated(keep="last")]
+    s = s.sort_index()
 
-# ===== pct helpers =====
-def clamp_pct(p: float) -> float:
-    if not USE_CLAMP:
-        return p
-    if p >  CLAMP_PCT: return CLAMP_PCT
-    if p < -CLAMP_PCT: return -CLAMP_PCT
-    return p
+    # 年レンジ sanity
+    s = s[(s.index.year >= 2000) & (s.index.year <= 2100)]
 
-def calc_pct(base: float, x: float) -> float:
-    denom = max(abs(base), EPS)
-    return clamp_pct((x - base) / denom * 100.0)
+    out = pd.DataFrame({"ts": s.index, "val": s.values}).reset_index(drop=True)
+    log(f"loaded {src}: rows={len(out)}, col={col}")
+    return out
 
-def stable_baseline_1d(df_day: pd.DataFrame) -> float | None:
-    """10:00以降の最初の非ゼロ/非極小を基準。なければ最初の有効値"""
-    if df_day.empty:
-        return None
-    h = df_day["ts"].dt.hour
-    m = df_day["ts"].dt.minute
-    after_10 = (h > 10) | ((h == 10) & (m >= 0))
-    cand = df_day.loc[after_10 & (df_day["val"].abs() > EPS)]
-    if not cand.empty:
-        return float(cand.iloc[0]["val"])
-    cand2 = df_day.loc[df_day["val"].abs() > EPS]
-    if not cand2.empty:
-        return float(cand2.iloc[0]["val"])
-    return float(df_day.iloc[0]["val"])
+# ──────────────────────────────────────────────────────────────────────
+# 期間切り出し（level をそのまま描画）
+SPAN_DAYS = {"7d": 7, "1m": 30, "1y": 365}
 
-def make_pct_series(df: pd.DataFrame, span: str) -> pd.DataFrame:
+def slice_span(df: pd.DataFrame, span: str) -> pd.DataFrame:
     if df.empty:
         return df
-
-    if span == "1d":
-        the_day = df["ts"].dt.floor("D").iloc[-1]
-        d = df[df["ts"].dt.floor("D") == the_day].copy()
-        if d.empty:
-            return d
-        base = stable_baseline_1d(d)
-        if base is None:
-            return pd.DataFrame()
-        d["pct"] = d["val"].apply(lambda v: calc_pct(base, v))
-        return d
-
-    # 7d/1m/1y: 期間先頭の値を基準
-    last = df["ts"].max()
-    days = {"7d": 7, "1m": 30, "1y": 365}.get(span, 7)
-    w = df[df["ts"] >= (last - pd.Timedelta(days=days))].copy()
-    if w.empty:
-        return w
-    base = float(w.iloc[0]["val"])
-    w["pct"] = w["val"].apply(lambda v: calc_pct(base, v))
+    days = SPAN_DAYS[span]
+    last_ts = df["ts"].max()
+    start   = last_ts - pd.Timedelta(days=days)
+    w = df[df["ts"] >= start].copy()
+    # 2点未満なら全体で補完（線が引けないため）
+    if len(w) < 2:
+        w = df.tail(2).copy()
     return w
 
-# ===== plotting =====
-def plot_span(dfp: pd.DataFrame, title: str, out_png: Path, ylabel="Change (%)"):
+# y軸が同値で潰れないようにパディング
+def pad_ylim(vals: np.ndarray, ratio: float = 0.05) -> tuple[float, float]:
+    vmin = float(np.nanmin(vals))
+    vmax = float(np.nanmax(vals))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return -1.0, 1.0
+    if vmin == vmax:
+        pad = max(1.0, abs(vmax) * 0.02)
+        return vmin - pad, vmax + pad
+    span = vmax - vmin
+    pad = span * ratio
+    return vmin - pad, vmax + pad
+
+# ──────────────────────────────────────────────────────────────────────
+# 描画
+def plot_level(df: pd.DataFrame, title: str, out_png: Path):
     fig, ax = plt.subplots()
-    apply_dark_theme(fig, ax)
-    ax.set_title(title, fontsize=26, fontweight="bold", pad=18)
-    ax.set_xlabel("Time", labelpad=10)
-    ax.set_ylabel(ylabel, labelpad=10)
-    ax.plot(dfp["ts"].values, dfp["pct"].values, linewidth=2.6, color="#ff615a")
+    apply_dark(ax, title, y_label="Level (index)")
+
+    # 実線は見やすい色・太さ
+    ax.plot(df["ts"].values, df["val"].values, linewidth=2.4, color="#ff615a")
+
+    # 日付軸
     major = AutoDateLocator(minticks=5, maxticks=10)
     ax.xaxis.set_major_locator(major)
     ax.xaxis.set_major_formatter(AutoDateFormatter(major))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
-    ax.yaxis.set_minor_locator(MaxNLocator(nbins=50))
+
+    # y パディング
+    ymin, ymax = pad_ylim(df["val"].values, ratio=0.06)
+    ax.set_ylim(ymin, ymax)
+
     fig.tight_layout()
     fig.savefig(out_png, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
-    diag(f"WROTE {out_png.name}  rows={len(dfp)}  min={dfp['pct'].min():.3f}  max={dfp['pct'].max():.3f}")
+    log(f"WROTE: {out_png.name}")
 
-# ===== main =====
+# ──────────────────────────────────────────────────────────────────────
 def main():
-    wrote_any = False
-    for span in ["1d", "7d", "1m", "1y"]:
-        csv = pick_csv_for_span(span)
-        if not csv:
-            diag(f"Skip {span}: no source csv")
+    df_all = load_history()
+    if df_all.empty:
+        log("no data -> skip")
+        return
+
+    for span in ["7d", "1m", "1y"]:
+        d = slice_span(df_all, span)
+        if d.empty or len(d) < 2:
+            log(f"skip {span}: not enough data")
             continue
-        df = load_csv_any(csv)
-        diag(f"Source for {span}: {csv.name}  rows={len(df)}")
+        title = f"{INDEX_KEY.upper()} ({span} level)"
+        out = OUT_DIR / f"{INDEX_KEY}_{span}.png"
+        plot_level(d, title, out)
 
-        if df.empty or ("ts" not in df) or ("val" not in df):
-            diag(f"Skip {span}: invalid dataframe")
-            continue
-
-        dfp = make_pct_series(df, span)
-        if dfp.empty or ("pct" not in dfp):
-            diag(f"Skip {span}: no pct series")
-            continue
-
-        out_png = OUT_DIR / f"{INDEX_KEY}_{span}.png"
-        plot_span(dfp, f"{INDEX_KEY.upper()} ({span})", out_png)
-        wrote_any = True
-
-    # マーカー（実行時刻を書くだけでも良い）
+    # 実行記録
     (OUT_DIR / "_last_run.txt").write_text(
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         encoding="utf-8",
     )
-    if not wrote_any:
-        diag("No chart written.")
 
 if __name__ == "__main__":
     main()
