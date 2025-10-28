@@ -1,11 +1,12 @@
-name: Generate long-term charts (R-BANK9 1d/7d/1m/1y + stats)
+name: Generate long-term charts (R-BANK9 7d/1m/1y + stats)
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '05 1 * * *'   # 10:05 JST（引け後）
 
-permissions: { contents: write }
+permissions:
+  contents: write
 
 concurrency:
   group: long-charts-${{ github.ref }}
@@ -15,19 +16,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     env:
       INDEX_KEY: rbank9
       OUT_DIR: docs/outputs
       MARKET_TZ: Asia/Tokyo
 
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0, persist-credentials: true }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - uses: actions/cache@v4
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -37,33 +45,47 @@ jobs:
         shell: bash
         run: |
           pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy matplotlib; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy matplotlib
+          fi
 
-      - name: Append daily to history (from intraday)
+      # （任意）直近 intraday から history に未収録の1日分を追記する補助スクリプト
+      # 無ければ何もしません。運用では false 推奨。
+      - name: Append daily to history (optional)
         shell: bash
         env:
-          APPEND_TODAY_IF_MISSING: "true"    # ← 今すぐ確認したい間だけ true、運用は false 推奨
+          APPEND_TODAY_IF_MISSING: "false"
         run: |
-          python scripts/update_history_from_intraday.py || true
-          tail -n 5 "$OUT_DIR/rbank9_history.csv" 2>/dev/null || true
+          python scripts/update_history_from_intraday.py 2>/dev/null || true
+          tail -n 5 "$OUT_DIR/${INDEX_KEY}_history.csv" 2>/dev/null || true
 
-      - name: Generate long-term charts
+      - name: Generate long-term charts (7d/1m/1y)
         shell: bash
         run: |
           python scripts/long_charts.py
           date -u +"%Y-%m-%dT%H:%M:%SZ" > "$OUT_DIR/_last_run.txt"
           ls -lah "$OUT_DIR" || true
 
-      - name: Commit if changed
+      - name: Commit if changed (exclude 1d)
         shell: bash
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global safe.directory "$(pwd)"
-          git add -A "$OUT_DIR"
+
+          # 1d はステージしない。必要な成果物だけ add
+          git add "$OUT_DIR/${INDEX_KEY}_7d.png" 2>/dev/null || true
+          git add "$OUT_DIR/${INDEX_KEY}_1m.png" 2>/dev/null || true
+          git add "$OUT_DIR/${INDEX_KEY}_1y.png" 2>/dev/null || true
+          git add "$OUT_DIR/${INDEX_KEY}_history.csv" 2>/dev/null || true
+          git add "$OUT_DIR/${INDEX_KEY}_stats.json" 2>/dev/null || true
+          git add "$OUT_DIR/_last_run.txt" 2>/dev/null || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore(rbank9): update history and 1d/7d/1m/1y charts"
+            git commit -m "chore(${INDEX_KEY}): update history and long-term charts (7d/1m/1y) + stats"
             git push
           fi
