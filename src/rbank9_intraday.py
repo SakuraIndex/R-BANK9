@@ -2,10 +2,14 @@
 """
 R-BANK9 intraday index snapshot
 等ウェイト / 前日終値比（%）で1日チャートを描画（黒背景・SNS向け）
+・終盤だけ一部銘柄しか配信されない “片肺” バーで平均が暴れる問題を回避
+  - 行ごとの「有効銘柄数」を判定し、しきい値未満は指数を更新せず前値をキープ
+  - 個別バーの外れ値（±20% 超）は除外
 """
 
 import os
 from typing import List
+from math import ceil
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -24,6 +28,10 @@ POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
 # JP は 1m が不安定なことがあるので 5m で安定運用
 INTRA_PERIOD = "7d"
 INTRA_INTERVAL = "5m"
+
+# ロバスト化パラメータ
+MIN_COVERAGE = 0.60       # 行に含まれる有効銘柄率がこれ未満なら “指数更新しない”
+OUTLIER_ABS_PCT = 20.0    # 個別バーの±20%超は外れ値として除外（NaN）
 
 # ---------- ユーティリティ ----------
 def jst_now() -> datetime:
@@ -50,10 +58,7 @@ def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
         ser = pd.to_numeric(close_like, errors="coerce").dropna()
         return ser
 
-    # DataFrame -> 数値化 & 全欠損列を落とす
     df = close_like.apply(pd.to_numeric, errors="coerce")
-
-    # ❗ ここを any(0) から any(axis=0) に変更
     mask = df.notna().any(axis=0)
     df = df.loc[:, mask]
 
@@ -63,7 +68,6 @@ def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
     if df.shape[1] == 1:
         ser = df.iloc[:, 0]
     else:
-        # 有効データ点数が最も多い列を選ぶ
         best_col = df.count(axis=0).idxmax()
         ser = df[best_col]
 
@@ -72,12 +76,10 @@ def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
     ser = ser.dropna()
     return ser
 
-
 def ensure_series_1dClose(df: pd.DataFrame) -> pd.Series:
     if "Close" not in df.columns:
         raise ValueError("Close column not found")
     close = df["Close"]
-    # （MultiIndex/重複列/複数列）をすべて吸収して 1D 化
     return _to_series_1d(close, df.index)
 
 def fetch_prev_close(ticker: str) -> float:
@@ -86,10 +88,9 @@ def fetch_prev_close(ticker: str) -> float:
     if d.empty:
         raise RuntimeError(f"[WARN] prev close empty for {ticker}")
     s = ensure_series_1dClose(d)
-    # 前日終値（直近 1 本前）
     if len(s) >= 2:
-        return float(s.iloc[-2])
-    return float(s.iloc[-1])
+        return float(s.iloc[-2])   # 前日終値
+    return float(s.iloc[-1])       # 代替
 
 def fetch_intraday_series(ticker: str) -> pd.Series:
     d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
@@ -107,9 +108,10 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
     s = s[(idx.date == last_day)]
     if s.empty:
         raise RuntimeError(f"[WARN] intraday filtered empty for {ticker}")
+    s.index = idx[(idx.date == last_day)]
     return s
 
-# ---------- 指数構築 ----------
+# ---------- 指数構築（ロバスト版） ----------
 def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
     rows = []
     for t in tickers:
@@ -118,6 +120,8 @@ def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
             prev = fetch_prev_close(t)
             intraday = fetch_intraday_series(t)
             pct = (intraday / prev - 1.0) * 100.0
+            # 外れ値除外（±20%超）
+            pct = pct.mask(pct.abs() > OUTLIER_ABS_PCT)
             rows.append(pct.rename(t))
         except Exception as e:
             print(f"[WARN] skip {t}  # {e}")
@@ -125,9 +129,24 @@ def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
     if not rows:
         raise RuntimeError("取得できた日中データが0でした。ティッカーを見直してください。")
 
+    # 行：時刻（JST）、列：各ティッカー（前日比%）
     df = pd.concat(rows, axis=1).sort_index()
-    df["R_BANK9"] = df.mean(axis=1, skipna=True)
-    return df
+
+    # 被覆率チェック：有効銘柄数が一定未満の行は指数を更新しない（前値キープ）
+    min_required = ceil(len(df.columns) * MIN_COVERAGE)
+    valid_count = df.notna().sum(axis=1)
+    df_masked = df.where(valid_count >= min_required)
+
+    # 指数：等金額平均（有効列のみ）。被覆率未満は NaN → 後で前方埋め
+    index_mean = df_masked.mean(axis=1, skipna=True)
+
+    # “指数を更新しない” 区間は前値をキープ（垂直スパイク回避）
+    index_mean = index_mean.ffill()
+
+    # まとまった DataFrame にして返す
+    out = df.copy()
+    out["R_BANK9"] = index_mean
+    return out
 
 # ---------- 可視化 ----------
 def pick_line_color(series: pd.Series) -> str:
