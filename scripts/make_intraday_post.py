@@ -12,9 +12,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# タイムゾーン：pandas は IANA 文字列でも扱える
 JST = "Asia/Tokyo"
 
 
+# =========================
+# Args
+# =========================
 @dataclass
 class Args:
     index_key: str
@@ -44,7 +48,8 @@ def parse_args() -> Args:
     p.add_argument("--day-anchor", default="09:00")
     p.add_argument("--basis", default="prev_close")
     p.add_argument("--value-type", default="percent")
-    p.add_argument("--dt-col", default="Unnamed: 0")  # 既定（列名不明でも自動検出あり）
+    # 既存CSVの日時列名が不定のため、指定があれば優先し、無ければ自動検出
+    p.add_argument("--dt-col", default="Unnamed: 0")
     p.add_argument("--label", default="R-BANK9")
     p.add_argument(
         "--csv-unit",
@@ -70,8 +75,9 @@ def parse_args() -> Args:
     )
 
 
-# -------------------- CSV 読み込み（ロバスト） --------------------
-
+# =========================
+# CSV 読み込み（ロバスト）
+# =========================
 def _try_parse_dt_col(df: pd.DataFrame, col: str) -> Optional[pd.DatetimeIndex]:
     if col in df.columns:
         ts = pd.to_datetime(df[col], utc=True, errors="coerce")
@@ -95,12 +101,10 @@ def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, str]:
 
 
 def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
-    # 読み込み
     df = pd.read_csv(csv_path)
     if df.empty:
         raise ValueError("CSV が空です。")
 
-    # Datetime index 化（指定→自動検出）
     idx: Optional[pd.DatetimeIndex] = None
     used_col: Optional[str] = None
     if prefer_col and prefer_col in df.columns:
@@ -125,8 +129,9 @@ def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
     return df
 
 
-# -------------------- セッション抽出 & 指数系 --------------------
-
+# =========================
+# セッション抽出・整形
+# =========================
 def _session_slice(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
     if df_jst.empty:
         return df_jst
@@ -136,51 +141,83 @@ def _session_slice(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataF
     return df_jst.loc[(df_jst.index >= start) & (df_jst.index <= end)]
 
 
+def _build_grid_for_day(last_day: pd.Timestamp | pd.DatetimeIndex, start_hm: str, end_hm: str) -> pd.DatetimeIndex:
+    if isinstance(last_day, pd.DatetimeIndex):
+        base = last_day[-1]
+    else:
+        base = last_day
+    sh, sm = map(int, start_hm.split(":"))
+    eh, em = map(int, end_hm.split(":"))
+    s = base.tz_convert(JST).replace(hour=sh, minute=sm, second=0, microsecond=0)
+    e = base.tz_convert(JST).replace(hour=eh, minute=em, second=0, microsecond=0)
+    return pd.date_range(s, e, freq="5T", tz=JST)
+
+
 def _detect_unit_is_ratio(df: pd.DataFrame) -> bool:
     vals = pd.to_numeric(df.to_numpy().ravel(), errors="coerce")
     vals = vals[~np.isnan(vals)]
     if vals.size == 0:
         return False
-    # だいたいのスケール判定：95%点が0.5未満 → ratio（= 0.5%未満が多い）
+    # スケール判定：95%点が0.5未満 → ratio とみなす
     return float(np.quantile(np.abs(vals), 0.95)) < 0.5
 
 
-def _to_percent_series(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
-    """
-    df_session: セッション内の DataFrame（R_BANK9 列が含まれることもある）
-    優先度:
-      1) 列名が index_key そのもの（例: 'R_BANK9' / 'R-BANK9'）ならその列を採用（既成集計を尊重）
-      2) それが無ければ、数値列のみ等加重平均で算出（単位を ratio→percent に補正）
-    返り値: ％（percent）単位の時系列
-    """
-    if df_session.empty:
-        return pd.Series(dtype=float)
+def _pick_component_cols(df: pd.DataFrame) -> List[str]:
+    """指数列や非数値列を除外して、構成銘柄候補を抽出"""
+    ban = {"R_BANK9", "R-BANK9", "INDEX", "Index", "index"}
+    cols: List[str] = []
+    for c in df.columns:
+        if c in ban:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().sum() > 0:
+            cols.append(c)
+    return cols
 
-    cols: List[str] = [c for c in df_session.columns if pd.api.types.is_numeric_dtype(df_session[c])]
-    dfn = df_session[cols].copy()
 
-    # 1) 既成の集計列があれば最優先で使う
-    keylike = [c for c in cols if c.strip().upper() in ("R_BANK9", "R-BANK9")]
-    if keylike:
-        s = pd.to_numeric(dfn[keylike[0]], errors="coerce")
-        return s
+def _align_and_filter(df_sess: pd.DataFrame, start_hm: str, end_hm: str,
+                      comp_cols: List[str], min_ratio: float = 1.0) -> pd.DataFrame:
+    """5分グリッドに再インデックス(ffill)し、十分に揃っていない行をドロップ"""
+    grid = _build_grid_for_day(df_sess.index, start_hm, end_hm)
+    aligned = df_sess.reindex(grid).ffill()
 
-    # 2) 等加重平均（単位を整える）
-    unit = csv_unit
-    if unit == "auto":
-        unit = "ratio" if _detect_unit_is_ratio(dfn) else "percent"
+    if not comp_cols:
+        return aligned
 
+    need = int(len(comp_cols) * min_ratio + 1e-9)
+    mask = aligned[comp_cols].count(axis=1) >= need
+    aligned = aligned.loc[mask]
+
+    # すべて落ちた場合は、閾値を少し緩めて救済
+    if aligned.empty and min_ratio > 0.8 and len(comp_cols) >= 2:
+        need = max(2, int(len(comp_cols) * 0.8 + 1e-9))
+        mask = df_sess.reindex(grid).ffill()[comp_cols].count(axis=1) >= need
+        aligned = df_sess.reindex(grid).ffill().loc[mask]
+
+    return aligned
+
+
+def _compute_index_percent(df_aligned: pd.DataFrame, comp_cols: List[str], csv_unit: str) -> pd.Series:
+    """構成銘柄の等ウェイト平均から R_BANK9 を再計算（％）"""
+    if csv_unit == "auto":
+        unit = "ratio" if _detect_unit_is_ratio(df_aligned[comp_cols]) else "percent"
+    else:
+        unit = csv_unit
+
+    dfn = df_aligned[comp_cols].astype(float)
     if unit == "ratio":
-        dfn = dfn * 100.0  # ratio→％
+        dfn = dfn * 100.0  # 倍率→％
 
     s = dfn.mean(axis=1, skipna=True)
-    # 大外れ緩和（ビジュアル崩れ防止）
+    # 壊れ値対策で軽くクリップ（視覚崩れ防止）
     s = s.clip(lower=-25.0, upper=25.0)
+    s.name = "R_BANK9"
     return s
 
 
-# -------------------- 出力 --------------------
-
+# =========================
+# 出力
+# =========================
 def _format_sign_pct(x: float) -> str:
     return f"{x:+.2f}%"
 
@@ -198,8 +235,7 @@ def _save_json(path: Path, index_key: str, label: str, pct_last_percent: float,
                basis: str, start_hm: str, end_hm: str, anchor_hm: str,
                now_ts_jst: pd.Timestamp) -> None:
     import json
-    # JSON は ratio（小数）で保存（サイト側と統一）
-    pct_ratio = float(np.round(pct_last_percent / 100.0, 6))
+    pct_ratio = float(np.round(pct_last_percent / 100.0, 6))  # ％→ratio
     payload = {
         "index_key": index_key,
         "label": label,
@@ -212,11 +248,7 @@ def _save_json(path: Path, index_key: str, label: str, pct_last_percent: float,
 
 
 def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
-    """
-    ここで **線色を最終値の正負で自動切替** します。
-       + → シアン（青系）  #00E5FF
-       - → レッド           #FF4D4D
-    """
+    """黒背景・最終値で色分け"""
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
     fig.patch.set_facecolor("#000000")
@@ -226,18 +258,17 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
         last_val = float(series_pct.iloc[-1])
         line_color = "#00E5FF" if last_val >= 0 else "#FF4D4D"
 
-        # 0% の基準線（薄いグレー）を表示すると視認性が上がる
         ax.axhline(0.0, color="#333333", linewidth=1.0, linestyle="-", zorder=0)
-
-        ax.plot(series_pct.index, series_pct.values, color=line_color, linewidth=2.0, zorder=3)
+        ax.plot(series_pct.index, series_pct.values, color=line_color, linewidth=2.2, zorder=3)
 
         last_ts = pd.to_datetime(series_pct.index[-1]).tz_convert(JST)
         sign = "+" if last_val >= 0 else ""
-        ax.set_title(f"{label} Intraday Snapshot ({last_ts.strftime('%Y/%m/%d %H:%M')})  {sign}{last_val:.2f}%", color="#D6E2EA")
+        ax.set_title(f"{label} Intraday Snapshot ({last_ts.strftime('%Y/%m/%d %H:%M')})  {sign}{last_val:.2f}%",
+                     color="#D6E2EA")
     else:
         ax.set_title(f"{label} Intraday Snapshot (no data)", color="#D6E2EA")
 
-    # 枠線とラベル
+    # 枠線・軸
     for side in ["top", "right", "left", "bottom"]:
         ax.spines[side].set_visible(True)
         ax.spines[side].set_color("#444444")
@@ -252,8 +283,9 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
     plt.close(fig)
 
 
-# -------------------- main --------------------
-
+# =========================
+# main
+# =========================
 def main() -> int:
     args = parse_args()
     print("=== Generate R-BANK9 intraday snapshot ===")
@@ -267,14 +299,26 @@ def main() -> int:
     if df_sess.empty:
         raise ValueError("セッション時間帯に該当するデータがありません。")
 
-    # 3) ％系列に変換（既成列 > 等加重）
-    series_pct = _to_percent_series(df_sess, args.csv_unit)
+    # 3) 構成銘柄列の抽出（指数列は使わず、必ず再計算）
+    comp_cols = _pick_component_cols(df_sess)
+    if not comp_cols:
+        raise ValueError("構成銘柄の数値列が見つかりません。")
 
-    # 4) 終値（％）
-    pct_last_percent = float(np.round(series_pct.iloc[-1], 4)) if not series_pct.empty else 0.0
+    # 4) 5分グリッドに再整列・ffill → 揃っていない行を除去（末尾の跳ね防止）
+    df_aligned = _align_and_filter(df_sess, args.session_start, args.session_end, comp_cols, min_ratio=1.0)
+    if df_aligned.empty:
+        raise ValueError("全ての行がアライン判定で除外されました。CSVの欠損状況をご確認ください。")
+
+    # 5) 等ウェイト平均から％シリーズを再計算
+    series_pct = _compute_index_percent(df_aligned, comp_cols, args.csv_unit)
+    if series_pct.empty:
+        raise ValueError("指数系列が生成できませんでした。")
+
+    # 6) 終値（％）
+    pct_last_percent = float(np.round(series_pct.iloc[-1], 4))
     now_ts_jst = pd.Timestamp.now(tz=JST)
 
-    # 5) 出力
+    # 7) 出力
     _plot_series(Path(args.snapshot_png), args.label, series_pct)
     print(f"[make_intraday_post] snapshot saved -> {args.snapshot_png}")
 
