@@ -7,8 +7,9 @@ on:
       session_end:   { description: "Session end (HH:MM JST)",   required: true, default: "15:30" }
       day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
+      value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
   # schedule:
-  #   - cron: "*/15 0-6 * * 1-5"   # JST 09:00-15:30 の例
+  #   - cron: "*/15 0-6 * * 1-5"   # JST 09:00-15:30 の例（UTCで記述）
 
 permissions:
   contents: write
@@ -22,6 +23,9 @@ env:
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
+  DT_COL: "ts"          # ← CSVのヘッダと一致させる
+  BASIS_DEFAULT: prev_close
+  VALUE_TYPE_DEFAULT: auto
 
   # 公開サイト（Sakura-Index-Site）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
@@ -29,26 +33,26 @@ env:
   PUBLISH_DIR: docs/charts/R_BANK9
   PUBLISH_TOKEN: ${{ secrets.SITE_PAT || secrets.SITE_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
 
-  # このリポ内の一時出力（生成物）
+  # このリポ内の一時出力
   OUT_JSON: docs/outputs/rbank9_stats.json
   OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
+
+  # 画像生成の安定化
+  MPLBACKEND: Agg
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -56,23 +60,48 @@ jobs:
           python -m pip install -U pip
           python -m pip install pandas matplotlib
 
-      - name: Verify script & prepare output dir
+      - name: Verify inputs & files
         run: |
           set -e
+          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
           test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
-          mkdir -p docs/outputs
+          echo "== CSV head =="
+          head -n 5 "${CSV}" || true
+          python - <<'PY'
+import pandas as pd, sys, os
+csv = os.environ["CSV"]
+dt  = os.environ["DT_COL"]
+df  = pd.read_csv(csv)
+if df.empty or dt not in df.columns:
+    print(f"❌ CSV empty or missing column: {dt}. columns={list(df.columns)}")
+    sys.exit(1)
+print(f"OK rows={len(df)} cols={list(df.columns)}")
+PY
+          mkdir -p "$(dirname "${OUT_JSON}")"
 
       - name: Generate intraday snapshot (JST)
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          BASIS:         ${{ inputs.basis         || env.BASIS_DEFAULT }}
+          VALUE_TYPE_IN: ${{ inputs.value_type    || env.VALUE_TYPE_DEFAULT }}
         run: |
           set -euo pipefail
           echo "=== Generate ${LABEL} intraday ==="
-          # スクリプトは固定パス（CSV/出力）で自己完結。CSVが無い/空でも内部でno-dataを生成。
-          python scripts/make_intraday_post.py
+          python scripts/make_intraday_post.py \
+            --index-key "${INDEX_KEY}" \
+            --csv "${CSV}" \
+            --out-json "${OUT_JSON}" \
+            --out-text "${OUT_TEXT}" \
+            --snapshot-png "${SNAPSHOT_PNG}" \
+            --session-start "${SESSION_START}" \
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --basis         "${BASIS}" \
+            --label         "${LABEL}" \
+            --dt-col        "${DT_COL}" \
+            --value-type    "${VALUE_TYPE_IN}"
           ls -l "${OUT_JSON}" "${OUT_TEXT}" "${SNAPSHOT_PNG}"
 
       - name: Checkout site repo
@@ -104,6 +133,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes for site."
           else
-            git commit -m "Update R-BANK9 intraday charts ($(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M JST'))"
+            git commit -m "Update R-BANK9 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
