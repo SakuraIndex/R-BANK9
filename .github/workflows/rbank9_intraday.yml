@@ -9,7 +9,7 @@ on:
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
       value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
   # schedule:
-  #   - cron: "*/15 0-6 * * 1-5"   # JST 09:00-15:30 の例（UTCで記述）
+  #   - cron: "*/15 0-6 * * 1-5"   # JST 09:00-15:30
 
 permissions:
   contents: write
@@ -19,11 +19,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  MPLBACKEND: Agg
+
   # 固有設定
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
-  DT_COL: "ts"          # ← CSVのヘッダと一致させる
+  DT_COL: ts
   BASIS_DEFAULT: prev_close
   VALUE_TYPE_DEFAULT: auto
 
@@ -33,13 +35,10 @@ env:
   PUBLISH_DIR: docs/charts/R_BANK9
   PUBLISH_TOKEN: ${{ secrets.SITE_PAT || secrets.SITE_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
 
-  # このリポ内の一時出力
+  # このリポ内の出力先
   OUT_JSON: docs/outputs/rbank9_stats.json
   OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
-
-  # 画像生成の安定化
-  MPLBACKEND: Agg
 
 jobs:
   build:
@@ -48,11 +47,13 @@ jobs:
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -65,18 +66,24 @@ jobs:
           set -e
           test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
           test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
-          echo "== CSV head =="
+          echo "== csv head =="
           head -n 5 "${CSV}" || true
+          # ここは YAML 的に安全なヒアドックで最小限検証
           python - <<'PY'
-import pandas as pd, sys, os
-csv = os.environ["CSV"]
-dt  = os.environ["DT_COL"]
-df  = pd.read_csv(csv)
-if df.empty or dt not in df.columns:
-    print(f"❌ CSV empty or missing column: {dt}. columns={list(df.columns)}")
-    sys.exit(1)
-print(f"OK rows={len(df)} cols={list(df.columns)}")
-PY
+          import os, sys, pandas as pd
+          csv = os.environ["CSV"]
+          dt  = os.environ.get("DT_COL","ts")
+          try:
+              df = pd.read_csv(csv)
+          except Exception as e:
+              sys.stderr.write(f"CSV read error: {e}\n")
+              sys.exit(1)
+          need = {dt, "pct"}
+          if df.empty or any(c not in df.columns for c in need):
+              sys.stderr.write(f"CSV invalid. need columns={need}, got={list(df.columns)} (rows={len(df)})\n")
+              sys.exit(1)
+          print(f"OK: rows={len(df)} cols={list(df.columns)}")
+          PY
           mkdir -p "$(dirname "${OUT_JSON}")"
 
       - name: Generate intraday snapshot (JST)
@@ -90,18 +97,18 @@ PY
           set -euo pipefail
           echo "=== Generate ${LABEL} intraday ==="
           python scripts/make_intraday_post.py \
-            --index-key "${INDEX_KEY}" \
-            --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
+            --index-key    "${INDEX_KEY}" \
+            --label        "${LABEL}" \
+            --csv          "${CSV}" \
+            --dt-col       "${DT_COL}" \
+            --value-type   "${VALUE_TYPE_IN}" \
+            --basis        "${BASIS}" \
+            --out-json     "${OUT_JSON}" \
+            --out-text     "${OUT_TEXT}" \
             --snapshot-png "${SNAPSHOT_PNG}" \
             --session-start "${SESSION_START}" \
             --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --basis         "${BASIS}" \
-            --label         "${LABEL}" \
-            --dt-col        "${DT_COL}" \
-            --value-type    "${VALUE_TYPE_IN}"
+            --day-anchor    "${DAY_ANCHOR}"
           ls -l "${OUT_JSON}" "${OUT_TEXT}" "${SNAPSHOT_PNG}"
 
       - name: Checkout site repo
