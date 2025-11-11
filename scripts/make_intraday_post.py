@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-R-BANK9 intraday snapshot/post generator (最終完全版)
+R-BANK9 intraday snapshot/post generator (最終完全版・頑健化)
 
 入力 CSV (どちらでも可):
   A) 縦持ち: ヘッダ ts,pct（例: 2025-11-11T09:05:00+09:00,0.12）
-  B) 横持ち: 1行目=ティッカー/コメント, 以降は 1列目=時刻, 2列目以降=各銘柄%（等加重平均を内部計算）
+  B) 横持ち: 1行目=ティッカー/コメント（例: ,5830.T,# いよぎん...,5831.T,# しずおか..., ...）
+             2行目以降: 1列目=時刻, 2列目以降=各銘柄の%（小数 / %表記 / 余分な空白・カンマ許容）
+             → 等加重平均を内部計算して ts,pct 形へ変換
 
 出力:
   - docs/outputs/rbank9_intraday.png   (ダークテーマ)
@@ -19,6 +21,7 @@ from pathlib import Path
 import argparse
 import json
 import re
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -34,12 +37,11 @@ TITLE         = "R-BANK9 Intraday Snapshot (JST)"
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    # 実際に使う4引数
     p.add_argument("--csv",          default=str(IN_CSV_DEF))
     p.add_argument("--out-json",     dest="out_json",     default=str(OUT_STAT_DEF))
     p.add_argument("--out-text",     dest="out_text",     default=str(OUT_TXT_DEF))
     p.add_argument("--snapshot-png", dest="snapshot_png", default=str(OUT_PNG_DEF))
-    # 互換（無視）
+    # 互換（無視してもOK）
     p.add_argument("--index-key", default=None)
     p.add_argument("--label", default=None)
     p.add_argument("--dt-col", default=None)
@@ -68,80 +70,108 @@ def setup_dark_theme():
 
 # ---------- CSV 読み取り（A: 縦持ち） ----------
 def _read_vertical(csv_path: Path) -> pd.DataFrame | None:
-    df = pd.read_csv(csv_path)
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return None
+
     cols = {c.lower().strip(): c for c in df.columns}
     if "ts" not in cols or "pct" not in cols:
         return None
+
     df = df.rename(columns={cols["ts"]: "ts", cols["pct"]: "pct"})
     df["ts"]  = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert("Asia/Tokyo")
     df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
     df = df.dropna(subset=["ts", "pct"]).sort_values("ts")
-    if df.empty:
-        return None
-    return df[["ts","pct"]]
+    return df[["ts","pct"]] if not df.empty else None
 
 # ---------- CSV 読み取り（B: 横持ち → 等加重平均） ----------
+_TICKER_RE = re.compile(r"\.T\s*$", re.IGNORECASE)
+
+def _looks_wide_header(cells: pd.Series) -> bool:
+    """1行目がティッカー/コメント風なら True"""
+    for x in cells.astype(str).fillna(""):
+        sx = x.strip()
+        if not sx:
+            continue
+        if sx.startswith("#"):
+            return True
+        if _TICKER_RE.search(sx):  # 末尾に ".T"
+            return True
+    return False
+
+def _to_number_series(s) -> pd.Series:
+    """ ' 0.12 ' / '0,12' / '0.12%' / '' など頑健に数値化 """
+    s2 = pd.Series(s).astype(str).str.strip()
+    s2 = s2.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+    return pd.to_numeric(s2, errors="coerce")
+
 def _read_wide(csv_path: Path) -> pd.DataFrame | None:
-    raw = pd.read_csv(csv_path, header=None, dtype=str)
+    try:
+        raw = pd.read_csv(csv_path, header=None, dtype=str)
+    except Exception:
+        return None
+
     if raw.empty or raw.shape[0] < 2:
         return None
 
-    # 1行目に ".T" や '#' が多いなら横持ちと判断
-    first_row = raw.iloc[0].astype(str).fillna("")
-    if not any(x.endswith(".T") or x.strip().startswith("#") for x in first_row):
+    first_row = raw.iloc[0]
+    if not _looks_wide_header(first_row):
         return None
 
-    # 2行目以降: 1列目=時刻、以降=各銘柄%（文字を数値化）
+    # 2行目以降がデータ
     data = raw.iloc[1:].reset_index(drop=True)
-    # 時刻列
+
+    # 1列目=時刻
     ts = pd.to_datetime(data.iloc[:, 0], errors="coerce", utc=True).dt.tz_convert("Asia/Tokyo")
 
-    # 数値列をまとめて等加重平均
+    # 2列目以降=各銘柄％
     if data.shape[1] < 2:
         return None
-    numeric_part = []
-    for i in range(1, data.shape[1]):
-        s = pd.to_numeric(data.iloc[:, i].str.replace(" ", "", regex=False), errors="coerce")
-        numeric_part.append(s)
 
-    if not numeric_part:
+    num_cols = []
+    for i in range(1, data.shape[1]):
+        num_cols.append(_to_number_series(data.iloc[:, i]))
+
+    if not num_cols:
         return None
 
-    import numpy as np
-    mat = np.vstack([s.to_numpy() for s in numeric_part]).T  # shape: (rows, ncols)
+    mat = np.vstack([c.to_numpy() for c in num_cols]).T  # shape: (rows, ncols)
     pct = np.nanmean(mat, axis=1)
 
     out = pd.DataFrame({"ts": ts, "pct": pct})
     out = out.dropna(subset=["ts"]).sort_values("ts")
-    if out.empty:
-        return None
-    return out
+    return out if not out.empty else None
 
 # ---------- 総合 CSV 読み取り ----------
 def read_csv_any(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         raise ValueError(f"CSV がありません: {csv_path}")
 
-    # BOM/空行除去（安全化）
+    # BOM/空行/行頭行末空白の除去（安全化）
     txt = csv_path.read_text(encoding="utf-8").replace("\ufeff", "")
     cleaned = "\n".join(line.strip() for line in txt.splitlines() if line.strip())
     if not cleaned:
         raise ValueError("CSV が空です。")
     csv_path.write_text(cleaned, encoding="utf-8")
 
-    # A) ts,pct を試す
+    # A) ts,pct
     df = _read_vertical(csv_path)
     if df is not None:
         return df
 
-    # B) 横持ち → 等加重平均を試す
+    # B) 横持ち
     df = _read_wide(csv_path)
     if df is not None:
         return df
 
-    # どちらでもなければ詳細を出して失敗
-    probe = pd.read_csv(csv_path, nrows=1, header=None)
-    raise ValueError(f"CSV 形式を解釈できません。先頭行={probe.iloc[0].tolist()}")
+    # どちらでもなければ詳細メッセージ
+    try:
+        probe = pd.read_csv(csv_path, nrows=1, header=None)
+        preview = probe.iloc[0].tolist()
+    except Exception:
+        preview = "読み取り失敗"
+    raise ValueError(f"CSV 形式を解釈できません。先頭行={preview}")
 
 # ---------- 描画 ----------
 def plot_series(df: pd.DataFrame, out_png: Path):
@@ -184,7 +214,7 @@ def main():
     args = parse_args()
 
     in_csv   = Path(args.csv) if args.csv else IN_CSV_DEF
-    out_png  = Path(args.snapshot_png) if args.snapshot_png else OUT_PNG_DEF  # ← argparse は '-' を '_' に変換
+    out_png  = Path(args.snapshot_png) if args.snapshot_png else OUT_PNG_DEF  # argparse は '-' → '_' 変換
     out_txt  = Path(args.out_text) if args.out_text else OUT_TXT_DEF
     out_stat = Path(args.out_json) if args.out_json else OUT_STAT_DEF
 
