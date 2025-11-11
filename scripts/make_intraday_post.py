@@ -25,17 +25,21 @@ from typing import Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
 
 TZ = "Asia/Tokyo"
 
 # ====== ダークテーマ（縁なし） ======
-BG = "#0b1220"      # 背景
-FG = "#d1d5db"      # 文字色
-GRID = "#334155"    # グリッド
+BG   = "#0b1220"   # 背景
+FG   = "#d1d5db"   # 文字色
+GRID = "#334155"   # グリッド
+LINE = "#f87171"   # 線色（視認性の良い赤系）
 
+# ================= ユーティリティ =================
 def _set_dark_matplotlib():
-    plt.rcParams["figure.facecolor"] = BG
-    plt.rcParams["axes.facecolor"] = BG
+    # 図・軸・保存すべてで背景をそろえる（白縁対策）
+    plt.rcParams["figure.facecolor"]  = BG
+    plt.rcParams["axes.facecolor"]    = BG
     plt.rcParams["savefig.facecolor"] = BG
     plt.rcParams["savefig.edgecolor"] = BG
 
@@ -48,6 +52,7 @@ def _style_axes(ax):
     ax.title.set_color(FG)
     ax.xaxis.label.set_color(FG)
     ax.yaxis.label.set_color(FG)
+    ax.margins(x=0)  # 余白を詰める
 
 # ---------------- Intraday CSV 読み ----------------
 def read_ts_pct(csv_path: Path) -> pd.DataFrame:
@@ -55,11 +60,17 @@ def read_ts_pct(csv_path: Path) -> pd.DataFrame:
     intraday CSV をラフにクレンジングして ts, pct を返す。
     - コメント行(#...), 空行, カンマ数≠1 行を除外
     - ヘッダの有無は問わない（header=None で読み、型変換時に NaT/NaN を落とす）
+    - tz-naive/UTC どちらでも JST に統一
+    - 異常値(±30%超)は除外
     """
     if not csv_path.exists():
         return pd.DataFrame(columns=["ts", "pct"])
 
     raw = csv_path.read_text(encoding="utf-8", errors="ignore")
+    # BOM除去
+    if raw.startswith("\ufeff"):
+        raw = raw.lstrip("\ufeff")
+
     lines = []
     for line in raw.splitlines():
         s = line.strip()
@@ -67,7 +78,6 @@ def read_ts_pct(csv_path: Path) -> pd.DataFrame:
             continue
         if s.count(",") != 1:
             continue
-        # 例: "ts,pct" のヘッダも混ざって良い（後で NaT/NaN で落ちる）
         lines.append(s)
 
     if not lines:
@@ -79,11 +89,29 @@ def read_ts_pct(csv_path: Path) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["ts", "pct"])
 
-    # 型変換（タイムゾーンは JST に統一）
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(TZ)
-    df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
-    df = df.dropna(subset=["ts", "pct"]).sort_values("ts").reset_index(drop=True)
-    return df
+    # 型変換 (ts → JST, pct → float)
+    ts = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+    # ts が tz-naive 混入の場合にも対応（NaT を補正）
+    if ts.isna().any():
+        ts2 = pd.to_datetime(df["ts"], errors="coerce")
+        # naive を JST と見なす
+        ts2 = ts2.dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT")
+        ts = ts.fillna(ts2)
+    # JST へ
+    ts = ts.dt.tz_convert(TZ)
+
+    pct = pd.to_numeric(df["pct"], errors="coerce")
+
+    d = pd.DataFrame({"ts": ts, "pct": pct}).dropna().sort_values("ts")
+
+    # 異常値の除外（±30%超）
+    d = d[(d["pct"] >= -30) & (d["pct"] <= 30)]
+
+    # 重複タイムスタンプの最後を採用
+    if not d.empty:
+        d = d.drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+
+    return d[["ts", "pct"]]
 
 def latest_pct_from_intraday(df: pd.DataFrame) -> Optional[float]:
     if df is None or df.empty:
@@ -127,23 +155,39 @@ def read_history_pct(history_csv: Path) -> Optional[float]:
 def render_chart(df: pd.DataFrame, out_png: Path, label: str):
     _set_dark_matplotlib()
     fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
+    # 図自体のパッチ色も念押し設定（白縁対策）
+    fig.patch.set_facecolor(BG)
+
     _style_axes(ax)
 
     title = f"{label} Intraday Snapshot (JST)"
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Change vs Prev Close (%)")
+
     if df.empty:
         ax.set_title(title + " (no data)")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Change vs Prev Close (%)")
-        # 線は描かない
     else:
-        ax.plot(df["ts"], df["pct"], linewidth=1.8, color="#f87171")  # 赤系（視認性）
         ax.set_title(title)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Change vs Prev Close (%)")
+        ax.plot(df["ts"], df["pct"], linewidth=1.8, color=LINE)
+
+        # 最新値を右肩に注記
+        last_ts = df["ts"].iloc[-1]
+        last_v  = df["pct"].iloc[-1]
+        ax.annotate(
+            f"{last_v:+.2f}%",
+            xy=(last_ts, last_v),
+            xytext=(6, 6),
+            textcoords="offset points",
+            color=FG,
+            fontsize=10,
+        )
+
+        # x 軸を時刻フォーマットに
+        ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    # 縁なし保存
+    # 縁なし保存（facecolor/edgecolorを統一）
     fig.savefig(out_png, bbox_inches="tight", facecolor=BG, edgecolor=BG)
     plt.close(fig)
 
@@ -159,8 +203,8 @@ def build_post(label: str, pct: Optional[float], basis: str, used_fallback: bool
 # ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)                  # intraday
-    ap.add_argument("--history-csv", required=False)         # history (fallback)
+    ap.add_argument("--csv", required=True)                  # intraday(ts,pct)
+    ap.add_argument("--history-csv", required=False)         # history(date,value) fallback
     ap.add_argument("--label", required=True)
     ap.add_argument("--index-key", required=True)
     ap.add_argument("--basis", default="prev_close")
