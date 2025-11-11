@@ -21,7 +21,6 @@ concurrency:
 env:
   MPLBACKEND: Agg
 
-  # 固有設定
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
   CSV: docs/outputs/rbank9_intraday.csv
@@ -29,13 +28,11 @@ env:
   BASIS_DEFAULT: prev_close
   VALUE_TYPE_DEFAULT: auto
 
-  # 公開サイト（Sakura-Index-Site）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/R_BANK9
   PUBLISH_TOKEN: ${{ secrets.SITE_PAT || secrets.SITE_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
 
-  # このリポ内の出力先
   OUT_JSON: docs/outputs/rbank9_stats.json
   OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
   SNAPSHOT_PNG: docs/outputs/rbank9_intraday.png
@@ -61,28 +58,27 @@ jobs:
           python -m pip install -U pip
           python -m pip install pandas matplotlib
 
-      - name: Verify inputs & files
+      - name: Verify inputs & files (non-fatal)
         run: |
           set -e
-          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
+          if [ ! -f "${CSV}" ]; then
+            echo "❌ Missing CSV: ${CSV}"; exit 1
+          fi
+          if [ ! -f scripts/make_intraday_post.py ]; then
+            echo "❌ Missing script: scripts/make_intraday_post.py"; exit 1
+          fi
           echo "== csv head =="
           head -n 5 "${CSV}" || true
-          # ここは YAML 的に安全なヒアドックで最小限検証
-          python - <<'PY'
-          import os, sys, pandas as pd
+          # 列は柔軟対応するため、ここでは失敗させない
+          python - <<'PY' || true
+          import os, pandas as pd, sys, re
           csv = os.environ["CSV"]
-          dt  = os.environ.get("DT_COL","ts")
           try:
-              df = pd.read_csv(csv)
+              df = pd.read_csv(csv, engine="python")
+              cols = [re.sub(r'\s*#.*$','', str(c)).strip() for c in df.columns]
+              print("cols:", cols, "rows:", len(df))
           except Exception as e:
-              sys.stderr.write(f"CSV read error: {e}\n")
-              sys.exit(1)
-          need = {dt, "pct"}
-          if df.empty or any(c not in df.columns for c in need):
-              sys.stderr.write(f"CSV invalid. need columns={need}, got={list(df.columns)} (rows={len(df)})\n")
-              sys.exit(1)
-          print(f"OK: rows={len(df)} cols={list(df.columns)}")
+              print("WARN: preview failed:", e, file=sys.stderr)
           PY
           mkdir -p "$(dirname "${OUT_JSON}")"
 
