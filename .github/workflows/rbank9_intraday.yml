@@ -8,9 +8,8 @@ on:
       day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
       value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
-  # JST 9:00–15:30 の 5分間隔で定期実行したい場合：
   # schedule:
-  #   - cron: "*/5 0-6 * * 1-5"
+  #   - cron: "*/5 0-6 * * 1-5"   # JST 09:00–15:30 で 5 分間隔
 
 permissions:
   contents: write
@@ -20,12 +19,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 入力CSV（指数リポの docs/outputs にある ts,pct 形式）
-  CSV: docs/outputs/rbank9_intraday.csv
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
 
-  # 公開先（サイトリポ）
+  # 入力: 指数リポの出力ファイル
+  CSV: docs/outputs/rbank9_intraday.csv
+  HISTORY_CSV: docs/outputs/rbank9_history.csv
+
+  # 公開先（サイトリポ側の配置）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/R_BANK9
@@ -35,33 +36,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
           python -m pip install -U pip
           python -m pip install pandas matplotlib pytz
 
-      - name: Verify inputs & files (non-fatal)
-        id: verify
+      - name: Verify inputs (non-fatal)
         continue-on-error: true
         run: |
-          set -e
-          echo "== csv path ==" && echo "${CSV}"
-          echo "== csv head =="
-          (head -n 20 "${CSV}" || true)
-          echo "== history head =="
-          (head -n 20 "$(dirname "${CSV}")/rbank9_history.csv" || true)
+          echo "== head ${CSV} =="
+          head -n 20 "${CSV}" || true
+          echo "== head ${HISTORY_CSV} =="
+          head -n 20 "${HISTORY_CSV}" || true
 
       - name: Generate intraday snapshot (JST)
         env:
@@ -75,8 +70,9 @@ jobs:
           echo "=== Generate ${LABEL} intraday ==="
           python scripts/make_intraday_post.py \
             --csv "${CSV}" \
-            --label "${LABEL}" \
+            --history-csv "${HISTORY_CSV}" \
             --index-key "${INDEX_KEY}" \
+            --label "${LABEL}" \
             --basis "${BASIS}" \
             --session-start "${SESSION_START}" \
             --session-end   "${SESSION_END}" \
@@ -85,7 +81,6 @@ jobs:
             --out-json      "site_stats.json" \
             --out-text      "site_post.txt" \
             --snapshot-png  "site_intraday.png"
-          ls -l site_*.json site_*.txt site_*.png
 
       - name: Checkout site repo
         uses: actions/checkout@v4
@@ -104,7 +99,6 @@ jobs:
           cp -f site_stats.json     "${dst}/stats.json"
           cp -f site_post.txt       "${dst}/post_intraday.txt"
           cp -f site_intraday.png   "${dst}/intraday.png"
-          echo "== published files =="
           ls -l "${dst}"
 
       - name: Commit & push site charts
