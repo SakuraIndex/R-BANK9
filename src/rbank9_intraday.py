@@ -15,7 +15,7 @@ R-BANK9 intraday index snapshot (equal-weight, vs prev close, percent)
 from __future__ import annotations
 
 import os
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from datetime import datetime, timezone, timedelta, time
 
 import pandas as pd
@@ -73,32 +73,22 @@ def load_tickers(path: str) -> List[str]:
 
 
 def _to_series_1d_close(df: pd.DataFrame) -> pd.Series:
-    """
-    yfinance の Close 列（形状ゆらぎを 1D に正規化）
-    """
     if "Close" not in df.columns:
         raise ValueError("Close column not found")
     close = df["Close"]
     if isinstance(close, pd.Series):
         return pd.to_numeric(close, errors="coerce").dropna()
 
-    # 万一 2D のとき
     d = close.apply(pd.to_numeric, errors="coerce")
     mask = d.notna().any(axis=0)
     d = d.loc[:, mask]
     if d.shape[1] == 0:
         raise ValueError("no numeric close column")
-    if d.shape[1] == 1:
-        s = d.iloc[:, 0]
-    else:
-        s = d[d.count(axis=0).idxmax()]
+    s = d.iloc[:, 0] if d.shape[1] == 1 else d[d.count(axis=0).idxmax()]
     return s.dropna().astype(float)
 
 
 def last_trading_day(ts_index: pd.DatetimeIndex) -> datetime.date:
-    """
-    与えられたインデックス（tz aware 可）から「最後の取引日（JST）」を返す
-    """
     idx = pd.to_datetime(ts_index)
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
@@ -107,109 +97,91 @@ def last_trading_day(ts_index: pd.DatetimeIndex) -> datetime.date:
 
 
 def fetch_prev_close(ticker: str, day: datetime.date) -> float:
-    """
-    指定した銘柄の「指定取引日の前日終値」を取得。
-    """
     d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"prev close empty for {ticker}")
-
     s = _to_series_1d_close(d)
     s.index = pd.to_datetime(s.index)
     if s.index.tz is None:
         s.index = s.index.tz_localize("UTC")
     s = s.tz_convert(JST)
-
-    # day より前の最後の終値
     s_before = s[s.index.date < day]
-    if s_before.empty:
-        # 直近しか無い場合は最後の値で代用（安全弁）
-        return float(s.iloc[-1])
-    return float(s_before.iloc[-1])
+    return float((s_before.iloc[-1] if not s_before.empty else s.iloc[-1]))
 
 
 def fetch_intraday_series(ticker: str) -> pd.Series:
-    """
-    指定銘柄の直近 INTRA_PERIOD x INTRA_INTERVAL を取得し、Close を返す（tz JST）
-    """
     d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
                     auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"intraday empty for {ticker}")
-
     s = _to_series_1d_close(d)
     idx = pd.to_datetime(s.index)
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
     idx = idx.tz_convert(JST)
-    s = pd.Series(s.values, index=idx)
-    return s
+    return pd.Series(s.values, index=idx)
 
 
-def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
+def day_grid(day: datetime.date) -> pd.DatetimeIndex:
+    start = pd.Timestamp.combine(day, SESSION_START).tz_localize(JST)
+    end   = pd.Timestamp.combine(day, SESSION_END).tz_localize(JST)
+    return pd.date_range(start=start, end=end, freq=INTRA_INTERVAL, tz=JST)
+
+
+def build_equal_weight_pct(tickers: List[str]) -> Tuple[pd.Series, datetime.date]:
     """
     各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
     - 同一日の共通 5 分グリッドに reindex + ffill
     - クリップで異常値抑制
     """
-    indiv_pct: Dict[str, pd.Series] = {}
-
     # まず 1 銘柄で「直近の取引日」を決める
     probe = fetch_intraday_series(tickers[0])
     day = last_trading_day(probe.index)  # JST の直近取引日
+    grid = day_grid(day)
 
-    # その日のセッション時間帯だけを使う
+    indiv_pct: Dict[str, pd.Series] = {}
     def _slice_day(s: pd.Series) -> pd.Series:
         x = s[(s.index.date == day)]
         if x.empty:
-            # まれに取得時差で day-1 側に乗るケース → 最後の営業日を採用
             d2 = last_trading_day(s.index)
             x = s[(s.index.date == d2)]
         return x
 
-    # 共通のグリッド（5m）: pandas は combine(tzinfo=...) を持たない版があるため tz_localize を使う
-    grid_start = pd.Timestamp.combine(day, SESSION_START).tz_localize(JST)
-    grid_end   = pd.Timestamp.combine(day, SESSION_END).tz_localize(JST)
-    grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST)
-
     for t in tickers:
         try:
-            intraday = fetch_intraday_series(t)
-            intraday = _slice_day(intraday)
+            intraday = _slice_day(fetch_intraday_series(t))
             if intraday.empty:
                 print(f"[WARN] {t}: no intraday for target day, skip")
                 continue
-
             prev = fetch_prev_close(t, day)
             pct = (intraday / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
-
-            # 共通グリッドに揃え、前方埋めで密に
-            pct = pct.reindex(grid).ffill()
+            pct = pct.reindex(grid).ffill()  # 先頭は NaN → 後で埋める
             indiv_pct[t] = pct.rename(t)
         except Exception as e:
             print(f"[WARN] skip {t}  # {e}")
 
     if not indiv_pct:
-        raise RuntimeError("0 series collected. Check tickers or network.")
+        # 1本も作れない場合はゼログリッドで返す（空CSV防止）
+        return pd.Series(0.0, index=grid, name="R_BANK9"), day
 
     df = pd.concat(indiv_pct.values(), axis=1)
     series = df.mean(axis=1, skipna=True).astype(float)
+    # 先頭 NaN をフラットに埋め、残存 NaN も 0 で埋めておく（CSV 空防止）
+    series = series.ffill().fillna(0.0)
     series.name = "R_BANK9"
-    return series
+    return series, day
 
 
-def save_ts_pct_csv(series: pd.Series, path: str) -> None:
+def save_ts_pct_csv(series: pd.Series, day: datetime.date, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    idx = pd.DatetimeIndex(series.index).tz_convert(JST)
-    # DatetimeIndex には isoformat() が無いので各 Timestamp に map する
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        # 念のため最終防御：ゼログリッドを生成
+        s = pd.Series(0.0, index=day_grid(day))
+    idx = pd.DatetimeIndex(s.index).tz_convert(JST)
     ts_list = [ts.isoformat() for ts in idx.to_pydatetime()]
-    out = pd.DataFrame({
-        "ts": ts_list,
-        "pct": pd.to_numeric(series, errors="coerce").round(4)
-    })
-    out = out.dropna(subset=["pct"])
-    out.to_csv(path, index=False)
+    pd.DataFrame({"ts": ts_list, "pct": s.round(4)}).to_csv(path, index=False)
 
 
 def plot_debug(series: pd.Series, path: str) -> None:
@@ -230,7 +202,8 @@ def plot_debug(series: pd.Series, path: str) -> None:
     ax.set_xlabel("Time", color="white"); ax.set_ylabel("Change vs Prev Close (%)", color="white")
 
     fig.tight_layout()
-    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    fig.savefig(path, facecolor=fig.getfacecolor() if hasattr(fig, "getfacecolor") else "black",
+                bbox_inches="tight")
     plt.close(fig)
 
 
@@ -254,10 +227,10 @@ def main():
     tickers = load_tickers(TICKER_FILE)
     print(f"[INFO] tickers: {', '.join(tickers)}")
     print("[INFO] building equal-weight percent series...")
-    series = build_equal_weight_pct(tickers)
+    series, day = build_equal_weight_pct(tickers)
 
     # 出力
-    save_ts_pct_csv(series, CSV_PATH)
+    save_ts_pct_csv(series, day, CSV_PATH)
     plot_debug(series, IMG_PATH)
     save_post(series, POST_PATH)
 
