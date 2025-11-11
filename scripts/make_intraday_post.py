@@ -3,13 +3,12 @@
 
 """
 R-BANK9 intraday snapshot/post generator (robust)
-- 入力 CSV は rbank9_intraday.csv （推奨: ヘッダ ts,pct / 値は % ）
-- コメント行(#...)・ゴミ行・空行を無視して読み取る
-- 可能なら履歴CSV（rbank9_history.csv）でフォールバック（%）を補う
-- 出力:
-  * site_intraday.png
-  * site_post.txt
-  * site_stats.json
+
+優先順位:
+1) docs/outputs/rbank9_intraday.csv が ts,pct ならそのまま採用
+2) 同CSVが ts,val(レベル) なら、history から前日終値を取り % 化して採用
+3) それでも時系列が作れない場合は、level_from_intraday.py で最新レベルを推定し % のみ算出
+   （チャートは "no data" だが、ポストと stats は最新%を出す）
 """
 
 from __future__ import annotations
@@ -18,203 +17,208 @@ import argparse
 import io
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
-import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
+import pandas as pd
 
 TZ = "Asia/Tokyo"
 
-# ====== ダークテーマ（枠線なし） ======
+# ---------- dark theme ----------
 BG   = "#0b1220"   # 背景
-FG   = "#d1d5db"   # 文字色
-GRID = "#334155"   # グリッド
+FG   = "#d1d5db"   # 文字
+GRID = "#334155"   # 罫線
 
-def set_dark_axes(ax):
+def _set_dark(ax):
     ax.set_facecolor(BG)
-    for spine in ax.spines.values():
-        spine.set_visible(False)     # 枠線消去
+    for sp in ax.spines.values():
+        sp.set_visible(False)
     ax.tick_params(colors=FG, labelcolor=FG)
     ax.grid(True, alpha=0.35, color=GRID, linestyle="-", linewidth=0.7)
     ax.title.set_color(FG)
     ax.xaxis.label.set_color(FG)
     ax.yaxis.label.set_color(FG)
-
-def _clean_lines_for_ts_pct(raw: str) -> list[str]:
-    cleaned = []
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        # ts,pct の 2 要素だけを通す（カンマ1個）
-        if s.count(",") != 1:
-            continue
-        cleaned.append(s)
-    return cleaned
-
-def read_ts_pct(csv_path: Path) -> pd.DataFrame:
-    """
-    ts,pct を取り出して昇順に整える。
-    - コメント行(#...)や空行を除去
-    - 1 行にカンマが 1 個以外なら捨てる（= ノイズを除外）
-    - ts は tz-aware に、pct は float に
-    """
-    if not csv_path.exists():
-        return pd.DataFrame(columns=["ts", "pct"])
-
-    raw = csv_path.read_text(encoding="utf-8", errors="ignore")
-    cleaned_lines = _clean_lines_for_ts_pct(raw)
-    if not cleaned_lines:
-        return pd.DataFrame(columns=["ts", "pct"])
-
-    buf = io.StringIO("\n".join(cleaned_lines))
-    # ヘッダが ts,pct の場合も / 値だけの場合も吸収する
-    try:
-        df_try = pd.read_csv(buf, header=None)
-        if df_try.shape[1] == 2:
-            df_try.columns = ["ts", "pct"]
-        else:
-            return pd.DataFrame(columns=["ts", "pct"])
-    except Exception:
-        return pd.DataFrame(columns=["ts", "pct"])
-
-    # 文字列→型
-    df_try["ts"]  = pd.to_datetime(df_try["ts"], errors="coerce", utc=True)
-    df_try["ts"]  = df_try["ts"].dt.tz_convert(TZ)   # +09:00 を尊重してJSTへ
-    df_try["pct"] = pd.to_numeric(df_try["pct"], errors="coerce")
-
-    df_try = df_try.dropna(subset=["ts", "pct"]).sort_values("ts").reset_index(drop=True)
-    return df_try
-
-def read_history_pct(history_csv: Path) -> Optional[float]:
-    """
-    docs/outputs/rbank9_history.csv から直近値を % として読むフォールバック。
-    期待列: date,value もしくは 2 列だけの CSV（第2列が数値）
-    """
-    if not history_csv.exists():
-        return None
-    try:
-        txt = history_csv.read_text(encoding="utf-8", errors="ignore").strip()
-        if not txt:
-            return None
-        # コメントや空行を除く
-        lines = [l.strip() for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")]
-        if not lines:
-            return None
-        # カンマ区切り2列だけを残す
-        pure = [l for l in lines if l.count(",") >= 1]
-        if not pure:
-            return None
-        df = pd.read_csv(io.StringIO("\n".join(pure)))
-        # 列名吸収
-        cols = [c.lower().strip() for c in df.columns]
-        if len(cols) >= 2:
-            # 値列を第2列とみなす
-            vcol = df.columns[1]
-        else:
-            return None
-        s = pd.to_numeric(df[vcol], errors="coerce")
-        s = s.dropna()
-        if s.empty:
-            return None
-        return float(s.iloc[-1])
-    except Exception:
-        return None
-
-def latest_pct(df: pd.DataFrame) -> Optional[float]:
-    if df is None or df.empty:
-        return None
-    return float(df["pct"].iloc[-1])
-
-def render_chart(df: pd.DataFrame, out_png: Path, label: str):
-    # 図の背景もダークに
     plt.rcParams["figure.facecolor"] = BG
 
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
-    set_dark_axes(ax)
+# ---------- CSV 読み ----------
+def _clean_lines(text: str) -> list[str]:
+    out = []
+    for line in text.splitlines():
+        s = line.strip().replace("\ufeff", "")
+        if not s or s.startswith("#"):
+            continue
+        # 2列「っぽい」行だけ通す（カンマ1つ）
+        if s.count(",") != 1:
+            continue
+        out.append(s)
+    return out
 
-    title = f"{label} Intraday Snapshot (JST)"
+def _read_ts_val_like(csv_path: Path) -> pd.DataFrame:
+    """ts, value(pct か level) を best effort で読む。列名は無視し header=None で入れる。"""
+    if not csv_path.exists():
+        return pd.DataFrame(columns=["ts","val"])
+    raw = csv_path.read_text(encoding="utf-8", errors="ignore")
+    lines = _clean_lines(raw)
+    if not lines:
+        return pd.DataFrame(columns=["ts","val"])
+
+    buf = io.StringIO("\n".join(lines))
+    df = pd.read_csv(buf, header=None, names=["ts","val"])
+    # ts: tz-aware
+    ts = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert(TZ)
+    val = pd.to_numeric(df["val"], errors="coerce")
+    df = pd.DataFrame({"ts": ts, "val": val}).dropna().sort_values("ts").reset_index(drop=True)
+    return df
+
+def _detect_is_pct(series: pd.Series) -> bool:
+    """明らかに%らしいか簡易判定（-30%〜+30%内が多いなら%とみなす）"""
+    s = series.dropna()
+    if s.empty:
+        return False
+    inside = ((s >= -30) & (s <= 30)).mean()
+    return bool(inside >= 0.8)
+
+def _read_prev_close(history_csv: Optional[Path]) -> Optional[float]:
+    """docs/outputs/rbank9_history.csv など、date,value の2列（ヘッダ可/不可）を best effort で読む。"""
+    if not history_csv or not history_csv.exists():
+        return None
+    raw = history_csv.read_text(encoding="utf-8", errors="ignore")
+    lines = _clean_lines(raw)
+    if not lines:
+        return None
+    df = pd.read_csv(io.StringIO("\n".join(lines)), header=None, names=["date","value"])
+    d  = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    v  = pd.to_numeric(df["value"], errors="coerce")
+    df = pd.DataFrame({"date": d, "value": v}).dropna().sort_values("date")
     if df.empty:
-        # 何も描かない（余計な線・枠が出ない）
+        return None
+    today = pd.Timestamp.now(tz=TZ).date()
+    prev = df[df["date"].dt.date < today]
+    if prev.empty:
+        prev = df.iloc[:-1] if len(df) >= 2 else df
+    return float(prev.iloc[-1]["value"]) if not prev.empty else None
+
+def _guess_close_level(index_key: str, outputs_dir: Path) -> Optional[float]:
+    """level_from_intraday.py のロジックを最小限内蔵（外部呼び出し不要の簡易版）。"""
+    csv = outputs_dir / f"{index_key.lower()}_intraday.csv"
+    if not csv.exists():
+        return None
+    df = _read_ts_val_like(csv)
+    if df.empty:
+        return None
+    today = pd.Timestamp.now(tz=TZ).date()
+    dd = df[df["ts"].dt.date == today]
+    if dd.empty:
+        dd = df
+    return float(dd.iloc[-1]["val"])
+
+def _to_pct_from_level(df_level: pd.DataFrame, prev_close: Optional[float]) -> pd.DataFrame:
+    if prev_close is None or df_level.empty:
+        return pd.DataFrame(columns=["ts","pct"])
+    pct = (df_level["val"] / float(prev_close) - 1.0) * 100.0
+    out = pd.DataFrame({"ts": df_level["ts"], "pct": pct})
+    return out.dropna().sort_values("ts").reset_index(drop=True)
+
+# ---------- 可視化 ----------
+def _render(df_pct: pd.DataFrame, out_png: Path, label: str):
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
+    _set_dark(ax)
+    title = f"{label} Intraday Snapshot (JST)"
+    if df_pct.empty:
         ax.set_title(title + " (no data)")
         ax.set_xlabel("Time")
         ax.set_ylabel("Change vs Prev Close (%)")
+        # 何も描かない（枠線は非表示）
     else:
-        ax.plot(df["ts"], df["pct"], linewidth=1.8)
+        ax.plot(df_pct["ts"], df_pct["pct"], linewidth=1.8)
         ax.set_title(title)
         ax.set_xlabel("Time")
         ax.set_ylabel("Change vs Prev Close (%)")
-
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
-def build_post(label: str, pct: Optional[float], basis: str, used_fallback: bool) -> str:
+def _latest(df_pct: pd.DataFrame) -> Optional[float]:
+    return None if df_pct.empty else float(df_pct.iloc[-1]["pct"])
+
+def _build_post(label: str, pct: Optional[float], basis: str) -> str:
     stamp = pd.Timestamp.now(tz=TZ).strftime("%Y/%m/%d %H:%M")
     if pct is None:
         return f"▲ {label} 日中スナップショット（no data）\n+0.00%（基準: {basis}）\n#R_BANK9 #日本株\n"
     sign = "+" if pct >= 0 else ""
-    note = "（履歴値）" if used_fallback else ""
-    return f"▲ {label} 日中スナップショット（{stamp} JST）{note}\n{sign}{pct:.2f}%（基準: {basis}）\n#R_BANK9 #日本株\n"
+    return f"▲ {label} 日中スナップショット（{stamp} JST）\n{sign}{pct:.2f}%（基準: {basis}）\n#R_BANK9 #日本株\n"
 
+# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--label", required=True)
-    ap.add_argument("--index-key", required=True)
-    ap.add_argument("--basis", default="prev_close")
+    ap.add_argument("--csv",          required=True)  # docs/outputs/rbank9_intraday.csv
+    ap.add_argument("--history-csv",  default="docs/outputs/rbank9_history.csv")
+    ap.add_argument("--index-key",    required=True)
+    ap.add_argument("--label",        required=True)
+    ap.add_argument("--basis",        default="prev_close")
     ap.add_argument("--session-start", default="09:00")
-    ap.add_argument("--session-end", default="15:30")
-    ap.add_argument("--day-anchor", default="09:00")
-    ap.add_argument("--value-type", default="auto")
-    ap.add_argument("--out-json", required=True)
-    ap.add_argument("--out-text", required=True)
+    ap.add_argument("--session-end",   default="15:30")
+    ap.add_argument("--day-anchor",    default="09:00")
+    ap.add_argument("--value-type",    default="auto")  # 将来拡張用
+    ap.add_argument("--out-json",     required=True)
+    ap.add_argument("--out-text",     required=True)
     ap.add_argument("--snapshot-png", required=True)
     args = ap.parse_args()
 
     csv_path = Path(args.csv)
+    hist_csv = Path(args.history-csv) if args.history_csv else None
     out_png  = Path(args.snapshot_png)
     out_txt  = Path(args.out_text)
     out_json = Path(args.out_json)
 
-    # 1) intraday(ts,pct) を読む
-    df = read_ts_pct(csv_path)
+    # 1) とりあえず 2列で読む
+    d = _read_ts_val_like(csv_path)
 
-    # 2) 最新値
-    lp = latest_pct(df)
-    used_fallback = False
+    df_pct = pd.DataFrame(columns=["ts","pct"])
+    latest_pct_val: Optional[float] = None
 
-    # 3) フォールバック（intraday 空のときのみ）
-    if lp is None:
-        # 同ディレクトリの履歴CSVを試す
-        hist_path = csv_path.with_name("rbank9_history.csv")
-        h = read_history_pct(hist_path)
-        if h is not None:
-            lp = h
-            used_fallback = True
+    if not d.empty:
+        if _detect_is_pct(d["val"]):
+            # ts,pct だった
+            df_pct = d.rename(columns={"val":"pct"})
+        else:
+            # ts, level だったので % 化
+            prev_close = _read_prev_close(hist_csv)
+            df_pct = _to_pct_from_level(d, prev_close)
 
-    # 4) チャート（no data なら線は描かない）
-    render_chart(df, out_png, args.label)
+    if df_pct.empty:
+        # 3) どうしても時系列が作れない → 最新レベルだけ推定し % を算出（投稿には使う）
+        prev_close = _read_prev_close(hist_csv)
+        guessed = _guess_close_level(args.index_key, Path("docs/outputs"))
+        if prev_close is not None and guessed is not None:
+            latest_pct_val = (float(guessed) / float(prev_close) - 1.0) * 100.0
 
-    # 5) ポスト文
-    post = build_post(args.label, lp, args.basis, used_fallback)
+    # チャート（no data でも枠線無しのダーク）
+    _render(df_pct, out_png, args.label)
+
+    # 最新%（時系列にあればそちらを優先）
+    latest_pct_val = _latest(df_pct) if not df_pct.empty else latest_pct_val
+
+    # post
+    post = _build_post(args.label, latest_pct_val, args.basis)
     out_txt.write_text(post, encoding="utf-8")
 
-    # 6) stats.json
+    # stats.json
     out_json.write_text(
         json.dumps(
             {
                 "index_key": args.index_key,
                 "label": args.label,
-                "pct_intraday": 0.0 if lp is None else lp,
+                "pct_intraday": 0.0 if latest_pct_val is None else latest_pct_val,
                 "basis": args.basis,
                 "session": {
                     "start": args.session_start,
                     "end":   args.session_end,
-                    "anchor": args.day_anchor
+                    "anchor": args.day_anchor,
                 },
-                "used_fallback": used_fallback,
                 "updated_at": pd.Timestamp.now(tz=TZ).isoformat(),
             },
             ensure_ascii=False,
