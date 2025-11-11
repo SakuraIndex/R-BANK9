@@ -9,7 +9,7 @@ on:
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
       value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
   # schedule:
-  #   - cron: "*/5 0-6 * * 1-5"   # JST 09:00–15:30 で 5 分間隔
+  #   - cron: "*/5 0-6 * * 1-5"   # JST 09:00–15:30 を 5分間隔
 
 permissions:
   contents: write
@@ -19,14 +19,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  INDEX_KEY: R_BANK9
-  LABEL: R-BANK9
-
-  # 入力: 指数リポの出力ファイル
+  # 入力CSV（指数リポの docs/outputs にある）
   CSV: docs/outputs/rbank9_intraday.csv
   HISTORY_CSV: docs/outputs/rbank9_history.csv
 
-  # 公開先（サイトリポ側の配置）
+  INDEX_KEY: R_BANK9
+  LABEL: R-BANK9
+
+  # 公開先（サイトリポ）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/R_BANK9
@@ -36,6 +36,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
@@ -53,9 +54,9 @@ jobs:
       - name: Verify inputs (non-fatal)
         continue-on-error: true
         run: |
-          echo "== head ${CSV} =="
+          echo "== head intraday =="
           head -n 20 "${CSV}" || true
-          echo "== head ${HISTORY_CSV} =="
+          echo "== head history =="
           head -n 20 "${HISTORY_CSV}" || true
 
       - name: Generate intraday snapshot (JST)
@@ -71,16 +72,16 @@ jobs:
           python scripts/make_intraday_post.py \
             --csv "${CSV}" \
             --history-csv "${HISTORY_CSV}" \
-            --index-key "${INDEX_KEY}" \
             --label "${LABEL}" \
+            --index-key "${INDEX_KEY}" \
             --basis "${BASIS}" \
             --session-start "${SESSION_START}" \
-            --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --value-type    "${VALUE_TYPE_IN}" \
-            --out-json      "site_stats.json" \
-            --out-text      "site_post.txt" \
-            --snapshot-png  "site_intraday.png"
+            --session-end "${SESSION_END}" \
+            --day-anchor "${DAY_ANCHOR}" \
+            --value-type "${VALUE_TYPE_IN}" \
+            --out-json "site_stats.json" \
+            --out-text "site_post.txt" \
+            --snapshot-png "site_intraday.png"
 
       - name: Checkout site repo
         uses: actions/checkout@v4
@@ -96,9 +97,9 @@ jobs:
           set -e
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          cp -f site_stats.json     "${dst}/stats.json"
-          cp -f site_post.txt       "${dst}/post_intraday.txt"
-          cp -f site_intraday.png   "${dst}/intraday.png"
+          cp -f site_stats.json    "${dst}/stats.json"
+          cp -f site_post.txt      "${dst}/post_intraday.txt"
+          cp -f site_intraday.png  "${dst}/intraday.png"
           ls -l "${dst}"
 
       - name: Commit & push site charts
