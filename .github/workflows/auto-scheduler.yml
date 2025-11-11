@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
+    env:
+      OUT_DIR: docs/outputs
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,13 +34,13 @@ jobs:
 
           case "$REPO_LC" in
             3_sakura_space)
-              KEY="astra4"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/astra4_intraday.py" ;;
+              KEY="astra4"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="scripts/update_history_from_intraday.py" ;;
             s-coin-)
-              KEY="scoin_plus"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/scoin_plus_intraday.py" ;;
+              KEY="scoin_plus"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="scripts/update_history_from_intraday.py" ;;
             r-bank9)
-              KEY="rbank9"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/rbank9_intraday.py" ;;
+              KEY="rbank9"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="scripts/update_history_from_intraday.py" ;;
             ain-10)
-              KEY="ain10"; TZ="America/New_York"; S="09:30"; E="16:00"; INTRA="src/ain10_snapshot.py" ;; # ←このファイル名はリポに合わせて。違えば修正してください
+              KEY="ain10"; TZ="America/New_York"; S="09:30"; E="16:00"; INTRA="scripts/update_history_from_intraday.py" ;;
             *)
               echo "Unknown repo: $REPO_RAW"; exit 1 ;;
           esac
@@ -47,6 +50,7 @@ jobs:
           echo "SESSION_START=$S"     | tee -a "$GITHUB_ENV"
           echo "SESSION_END=$E"       | tee -a "$GITHUB_ENV"
           echo "INTRA_SCRIPT=$INTRA"  | tee -a "$GITHUB_ENV"
+          echo "OUT_CSV=${{ env.OUT_DIR }}/$KEY"_intraday.csv | tee -a "$GITHUB_ENV"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -57,8 +61,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # 念のためのフォールバック（requirementsに無い場合に備える）
+          pip install --upgrade pandas matplotlib yfinance pytz || true
 
       - name: Compute session flags (DST-aware)
         id: flags
@@ -68,7 +76,7 @@ jobs:
           python - << 'PY'
           from datetime import datetime, time, timedelta
           from zoneinfo import ZoneInfo
-          import os
+          import os, pathlib
           tz = ZoneInfo(os.environ["MARKET_TZ"])
           s_h, s_m = map(int, os.environ["SESSION_START"].split(":"))
           e_h, e_m = map(int, os.environ["SESSION_END"].split(":"))
@@ -82,9 +90,11 @@ jobs:
           # クローズ後の確定生成は終了後 +[0,20) 分の“窓”で一度だけ
           at_close_window = end <= now < end + timedelta(minutes=20)
           # すでに確定処理を終えたか（docs/outputs/_last_run.txt に close-YYYY-MM-DD を記録）
+          out_dir = pathlib.Path("docs/outputs")
+          out_dir.mkdir(parents=True, exist_ok=True)
           last_flag = ""
           try:
-              with open("docs/outputs/_last_run.txt","r",encoding="utf-8") as f:
+              with open(out_dir/"_last_run.txt","r",encoding="utf-8") as f:
                   last_flag = f.read().strip()
           except FileNotFoundError:
               pass
@@ -98,7 +108,7 @@ jobs:
               g.write(f"close_key={close_key}\n")
           PY
 
-      # 営業時間中：5分おきにintradayを更新・コミット
+      # 営業時間中：5分おきに intraday を生成・コミット（CSV は docs/outputs/<key>_intraday.csv）
       - name: Run intraday (every 5 min during session)
         if: steps.flags.outputs.in_session == 'true'
         env:
@@ -106,15 +116,23 @@ jobs:
           MARKET_TZ: ${{ env.MARKET_TZ }}
           SESSION_START: ${{ env.SESSION_START }}
           SESSION_END: ${{ env.SESSION_END }}
+          OUT_CSV: ${{ env.OUT_CSV }}
         shell: bash
         run: |
           set -euo pipefail
           echo "== intraday =="
-          python "$INTRA_SCRIPT" || true
+          echo "generator: $INTRA_SCRIPT"
+          echo "out csv  : $OUT_CSV"
+          mkdir -p "${OUT_DIR}"
+          # 当日intradayを更新するスクリプト。存在しない旧パスではなく scripts/update_history_from_intraday.py を使用
+          python "$INTRA_SCRIPT" --index-key "${INDEX_KEY}" --out "${OUT_CSV}"
+          echo "tail of csv:"
+          tail -n 5 "${OUT_CSV}" || true
+          # commit/push
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/*intraday.* docs/outputs/*intraday.png 2>/dev/null || true
-          git commit -m "chore(intraday): ${INDEX_KEY}" || echo "no intraday changes"
+          git add "${OUT_CSV}" 2>/dev/null || true
+          git commit -m "chore(intraday): ${INDEX_KEY} csv ($(date '+%H:%M JST'))" || echo "no intraday changes"
           git push || true
 
       # クローズ直後：確定値のhistory追記＆長期PNG＆statsを一度だけ生成
@@ -133,12 +151,13 @@ jobs:
           if [ -f scripts/update_history.py ]; then
             python scripts/update_history.py || true
           fi
-          # 長期チャート＆stats（既存の long_charts.py を利用）
+          # 長期チャート＆stats
           python scripts/long_charts.py
           # 実行フラグを書き込んで二重実行を抑止
-          echo "${{ steps.flags.outputs.close_key }}" > docs/outputs/_last_run.txt
+          echo "${{ steps.flags.outputs.close_key }}" > "${OUT_DIR}/"_last_run.txt
+
           # 旧接頭辞の正規化（命名揺れ対策）
-          OUT="docs/outputs"; shopt -s nullglob
+          OUT="${OUT_DIR}"; shopt -s nullglob
           norm() { for f in "$OUT"/$1*; do base="$(basename "$f")"; new="$OUT/${base/$1/$2}"; [ "$f" = "$new" ] || mv -f "$f" "$new"; done; }
           case "$INDEX_KEY" in
             ain10)      norm "ain_10_" "ain10_";;
@@ -146,9 +165,10 @@ jobs:
             scoin_plus) norm "s_coin__" "scoin_plus_"; norm "s_coin_" "scoin_plus_";;
             astra4)     norm "3_sakura_space_" "astra4_";;
           esac
+
           # コミット
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/* 2>/dev/null || true
-          git commit -m "chore(close): ${INDEX_KEY} long charts & stats" || echo "no close changes"
+          git add "${OUT_DIR}"/* 2>/dev/null || true
+          git commit -m "chore(close): ${INDEX_KEY} long charts & stats ($(date '+%Y-%m-%d'))" || echo "no close changes"
           git push || true
