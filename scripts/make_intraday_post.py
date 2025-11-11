@@ -2,33 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-R-BANK9 intraday snapshot/post generator (最終版)
+R-BANK9 intraday snapshot/post generator (robust final)
 
-受け入れ形式:
-  1) 縦持ち: ヘッダ ts,pct
-  2) 横持ち: 先頭行 = [, 5830.T, # コメント, 5831.T, # コメント, ...]
-             2行目以降 = "ISO時刻, 各ティッカーの%値 …"
-    → 先頭セルが空でもOK。#列は自動的に無視。NaNは除外して等加重平均を算出。
+対応フォーマット
+- 縦持ち:   ts,pct
+- 横持ち:   先頭行にティッカー/コメント、2 行目以降は
+            「時刻, 値, 値, …, #コメント, …」
+  ※ 2 列目がすでに集計値でも OK（2 列目以降の数値セルを平均。1 つならそのまま）
 
-出力:
-  docs/outputs/rbank9_intraday.png
-  docs/outputs/rbank9_post_intraday.txt
-  docs/outputs/rbank9_stats.json
+出力
+- docs/outputs/rbank9_intraday.png（ダークテーマ）
+- docs/outputs/rbank9_post_intraday.txt
+- docs/outputs/rbank9_stats.json
 """
 
 from __future__ import annotations
 from pathlib import Path
 import argparse
 import json
-import re
-import math
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# 既定パス
 IN_CSV_DEF   = Path("docs/outputs/rbank9_intraday.csv")
 OUT_PNG_DEF  = Path("docs/outputs/rbank9_intraday.png")
 OUT_TXT_DEF  = Path("docs/outputs/rbank9_post_intraday.txt")
@@ -38,14 +35,14 @@ INDEX_KEY_DEF = "R_BANK9"
 LABEL_DEF     = "R-BANK9"
 TITLE         = "R-BANK9 Intraday Snapshot (JST)"
 
-# ---------- 引数 ----------
+# ---------------- args ----------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--csv",          default=str(IN_CSV_DEF))
     p.add_argument("--out-json",     dest="out_json",     default=str(OUT_STAT_DEF))
     p.add_argument("--out-text",     dest="out_text",     default=str(OUT_TXT_DEF))
     p.add_argument("--snapshot-png", dest="snapshot_png", default=str(OUT_PNG_DEF))
-    # 互換用（値は使わない）
+    # 互換用（値は使わない・受け取るだけ）
     p.add_argument("--index-key", default=None)
     p.add_argument("--label", default=None)
     p.add_argument("--dt-col", default=None)
@@ -56,29 +53,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--day-anchor", default=None)
     return p.parse_args()
 
-# ---------- ユーティリティ ----------
-_TICKER_RE = re.compile(r"\.T\s*$", re.IGNORECASE)
-
-def _clean_number(s: str) -> float | None:
-    """ ' 0.12 ' / '0,12' / '0.12%' / '' → float or None """
-    if s is None:
+# ---------------- helpers ----------------
+def _clean_num(x: str) -> float | None:
+    if x is None:
         return None
-    x = str(s).strip()
-    if not x or x.lower() == "nan":
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
         return None
-    x = x.replace(",", "").replace("%", "")
+    s = s.replace(",", "").replace("%", "")
     try:
-        return float(x)
+        return float(s)
     except Exception:
         return None
 
-def _lines_of(path: Path) -> List[str]:
-    txt = path.read_text(encoding="utf-8", errors="ignore").replace("\ufeff", "")
-    # 完全空行は捨てる・前後空白は温存（先頭カンマを壊さない）
-    return [ln.rstrip("\n\r") for ln in txt.splitlines() if ln.strip()]
+def _read_text_lines(p: Path) -> List[str]:
+    txt = p.read_text(encoding="utf-8", errors="ignore").replace("\ufeff", "")
+    # 空行は除去、先頭のカンマ（空セル）は壊さないよう strip はしない
+    return [ln.rstrip("\r\n") for ln in txt.splitlines() if ln.strip()]
 
-# ---------- 縦持ち(ts,pct)を読む ----------
-def _read_vertical(path: Path) -> pd.DataFrame | None:
+# ---------------- readers ----------------
+def read_vertical(path: Path) -> pd.DataFrame | None:
     try:
         df = pd.read_csv(path)
     except Exception:
@@ -89,92 +83,71 @@ def _read_vertical(path: Path) -> pd.DataFrame | None:
     df = df.rename(columns={cols["ts"]: "ts", cols["pct"]: "pct"})
     df["ts"]  = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert("Asia/Tokyo")
     df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
-    df = df.dropna(subset=["ts", "pct"]).sort_values("ts")
+    df = df.dropna(subset=["ts","pct"]).sort_values("ts")
     return df if not df.empty else None
 
-# ---------- 横持ちを手書きでパース ----------
-def _read_wide_text(path: Path) -> pd.DataFrame | None:
-    lines = _lines_of(path)
+def read_text_generic(path: Path) -> pd.DataFrame | None:
+    """先頭列=時刻、2 列目以降=“数値セルだけ”を拾って平均（1 つならそのまま）。"""
+    lines = _read_text_lines(path)
     if len(lines) < 2:
         return None
 
-    # 先頭行をカンマで素朴に分割（引用符は想定しない）
-    header_cells = [c.strip() for c in lines[0].split(",")]
-    # 先頭セルが空でもOK。2セル目以降で .T or '# ' を探す
-    has_ticker_or_hash = any(_TICKER_RE.search(c) or c.startswith("#") for c in header_cells[1:])
-    if not has_ticker_or_hash:
-        return None
-
-    # ティッカー列のインデックス（1 origin 側にある）
-    ticker_idx: List[int] = [i for i, c in enumerate(header_cells)
-                             if _TICKER_RE.search(c)]
-    if not ticker_idx:
-        return None
-
-    # データ行を回して ts と 各ティッカー列の値 を拾い、等加重平均
     ts_list: List[pd.Timestamp] = []
     pct_list: List[float] = []
 
+    # 1 行目はヘッダ（内容は使わない）
     for ln in lines[1:]:
         cells = [c.strip() for c in ln.split(",")]
         if not cells:
             continue
         ts_s = cells[0] if len(cells) > 0 else ""
-        try:
-            ts = pd.to_datetime(ts_s, errors="coerce", utc=True)
-        except Exception:
-            ts = pd.NaT
+        ts = pd.to_datetime(ts_s, errors="coerce", utc=True)
         if pd.isna(ts):
             continue
 
-        vals: List[float] = []
-        for idx in ticker_idx:
-            if idx >= len(cells):
-                continue
-            v = _clean_number(cells[idx])
-            if v is None or math.isnan(v):
-                continue
-            vals.append(v)
+        nums = []
+        for c in cells[1:]:
+            v = _clean_num(c)
+            if v is not None and np.isfinite(v):
+                nums.append(float(v))
 
-        if not vals:
-            # 値が全欠損ならスキップ
+        if not nums:
+            # 数値が 1 つもない行は無視
             continue
 
         ts_list.append(ts)
-        pct_list.append(float(np.mean(vals)))
+        pct_list.append(float(np.mean(nums)))  # 1 つならその値、複数なら平均
 
     if not ts_list:
         return None
 
     df = pd.DataFrame({"ts": ts_list, "pct": pct_list})
-    # UTC → JST
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("Asia/Tokyo")
     df = df.sort_values("ts")
     return df if not df.empty else None
 
-# ---------- 総合入口 ----------
 def read_csv_any(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise ValueError(f"CSV がありません: {path}")
 
-    # 1) まず縦持ち
-    df = _read_vertical(path)
+    # 1) 縦持ち優先
+    df = read_vertical(path)
     if df is not None:
         return df
 
-    # 2) 横持ち（手書きパーサ）
-    df = _read_wide_text(path)
+    # 2) 横持ち/ゆるい形式
+    df = read_text_generic(path)
     if df is not None:
         return df
 
-    # 3) デバッグ用に先頭行を見せる
+    # 3) どうしても読めない時はプレビューを埋め込んで例外
     try:
         preview = pd.read_csv(path, nrows=1, header=None).iloc[0].tolist()
     except Exception:
         preview = "読み取り失敗"
     raise ValueError(f"CSV 形式を解釈できません。先頭行={preview}")
 
-# ---------- 描画 ----------
+# ---------------- plot ----------------
 def _setup_dark():
     plt.rcParams.update({
         "figure.facecolor": "#0b1420",
@@ -194,8 +167,9 @@ def plot_series(df: pd.DataFrame, out_png: Path):
     _setup_dark()
     fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
     ax.plot(df["ts"], df["pct"])
-    ax.set_title("R-BANK9 Intraday Snapshot (JST)")
+    ax.set_title(TITLE)
     ax.set_xlabel("Time")
+    ax.set_label = "Change vs Prev Close (%)"
     ax.set_ylabel("Change vs Prev Close (%)")
     for sp in ax.spines.values():
         sp.set_color("#36506b")
@@ -204,13 +178,13 @@ def plot_series(df: pd.DataFrame, out_png: Path):
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
-# ---------- 出力 ----------
-def _post_text(latest: float, label: str) -> str:
+# ---------------- output ----------------
+def build_post_text(latest: float, label: str) -> str:
     sign = "+" if latest >= 0 else ""
     now_jst = pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y/%m/%d %H:%M JST")
     return f"▲ {label} 日中スナップショット（{now_jst}）\n{sign}{latest:.2f}%（基準: prev_close）\n#R_BANK9 #日本株\n"
 
-def _stats_json(latest: float, index_key: str, label: str) -> str:
+def build_stats_json(latest: float, index_key: str, label: str) -> str:
     obj = {
         "index_key": index_key,
         "label": label,
@@ -221,7 +195,7 @@ def _stats_json(latest: float, index_key: str, label: str) -> str:
     }
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
-# ---------- main ----------
+# ---------------- main ----------------
 def main():
     a = parse_args()
     in_csv   = Path(a.csv) if a.csv else IN_CSV_DEF
@@ -238,12 +212,12 @@ def main():
     plot_series(df, out_png)
 
     out_txt.parent.mkdir(parents=True, exist_ok=True)
-    out_txt.write_text(_post_text(latest, label), encoding="utf-8")
+    out_txt.write_text(build_post_text(latest, label), encoding="utf-8")
 
     out_stat.parent.mkdir(parents=True, exist_ok=True)
-    out_stat.write_text(_stats_json(latest, index_key, label), encoding="utf-8")
+    out_stat.write_text(build_stats_json(latest, index_key, label), encoding="utf-8")
 
-    print(f"[ok] rows={len(df)}, latest={latest:.4f}, out={out_png}")
+    print(f"[ok] rows={len(df)} latest={latest:.4f} file={out_png}")
 
 if __name__ == "__main__":
     main()
