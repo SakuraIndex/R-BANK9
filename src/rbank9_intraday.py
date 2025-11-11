@@ -8,7 +8,7 @@ R-BANK9 intraday index snapshot (equal-weight, vs prev close, percent)
 - 共通 5 分グリッドに reindex + ffill で整列
 - クリップで異常値を抑制
 - 出力: docs/outputs/rbank9_intraday.csv (ts,pct)
-        docs/outputs/rbank9_intraday.png（デバッグ）
+        docs/outputs/rbank9_intraday.png（デバッグ用）
         docs/outputs/rbank9_post_intraday.txt（簡易ポスト文）
 """
 
@@ -60,7 +60,6 @@ def load_tickers(path: str) -> List[str]:
             s = raw.strip()
             if not s or s.startswith("#"):
                 continue
-            # 行内コメント除去 → 先頭トークン
             s = s.split("#", 1)[0].strip()
             if not s:
                 continue
@@ -78,7 +77,6 @@ def _to_series_1d_close(df: pd.DataFrame) -> pd.Series:
     close = df["Close"]
     if isinstance(close, pd.Series):
         return pd.to_numeric(close, errors="coerce").dropna()
-
     d = close.apply(pd.to_numeric, errors="coerce")
     mask = d.notna().any(axis=0)
     d = d.loc[:, mask]
@@ -129,17 +127,11 @@ def day_grid(day: datetime.date) -> pd.DatetimeIndex:
 
 
 def build_equal_weight_pct(tickers: List[str]) -> Tuple[pd.Series, datetime.date]:
-    """
-    各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
-    - 同一日の共通 5 分グリッドに reindex + ffill
-    - クリップで異常値抑制
-    """
-    # まず 1 銘柄で「直近の取引日」を決める
     probe = fetch_intraday_series(tickers[0])
-    day = last_trading_day(probe.index)  # JST の直近取引日
+    day = last_trading_day(probe.index)
     grid = day_grid(day)
-
     indiv_pct: Dict[str, pd.Series] = {}
+
     def _slice_day(s: pd.Series) -> pd.Series:
         x = s[(s.index.date == day)]
         if x.empty:
@@ -156,18 +148,16 @@ def build_equal_weight_pct(tickers: List[str]) -> Tuple[pd.Series, datetime.date
             prev = fetch_prev_close(t, day)
             pct = (intraday / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
-            pct = pct.reindex(grid).ffill()  # 先頭は NaN → 後で埋める
+            pct = pct.reindex(grid).ffill()
             indiv_pct[t] = pct.rename(t)
         except Exception as e:
             print(f"[WARN] skip {t}  # {e}")
 
     if not indiv_pct:
-        # 1本も作れない場合はゼログリッドで返す（空CSV防止）
         return pd.Series(0.0, index=grid, name="R_BANK9"), day
 
     df = pd.concat(indiv_pct.values(), axis=1)
     series = df.mean(axis=1, skipna=True).astype(float)
-    # 先頭 NaN をフラットに埋め、残存 NaN も 0 で埋めておく（CSV 空防止）
     series = series.ffill().fillna(0.0)
     series.name = "R_BANK9"
     return series, day
@@ -175,13 +165,19 @@ def build_equal_weight_pct(tickers: List[str]) -> Tuple[pd.Series, datetime.date
 
 def save_ts_pct_csv(series: pd.Series, day: datetime.date, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    s = pd.to_numeric(series, errors="coerce").dropna()
+    s = pd.to_numeric(series, errors="coerce").fillna(0.0)
     if s.empty:
-        # 念のため最終防御：ゼログリッドを生成
         s = pd.Series(0.0, index=day_grid(day))
     idx = pd.DatetimeIndex(s.index).tz_convert(JST)
     ts_list = [ts.isoformat() for ts in idx.to_pydatetime()]
-    pd.DataFrame({"ts": ts_list, "pct": s.round(4)}).to_csv(path, index=False)
+    df = pd.DataFrame({"ts": ts_list, "pct": s.round(4)})
+
+    # --- 強制更新: JST現時刻行を追加 ---
+    now_ts = jst_now().isoformat()
+    df.loc[len(df)] = [now_ts, 0.0]
+
+    df.to_csv(path, index=False)
+    print(f"[INFO] CSV saved ({len(df)} rows) → {path}")
 
 
 def plot_debug(series: pd.Series, path: str) -> None:
@@ -199,11 +195,11 @@ def plot_debug(series: pd.Series, path: str) -> None:
     ax.tick_params(colors="white")
     ax.set_title(f"R-BANK9 Intraday Snapshot ({jst_now().strftime('%Y/%m/%d %H:%M JST')})",
                  color="white", fontsize=16, pad=10)
-    ax.set_xlabel("Time", color="white"); ax.set_ylabel("Change vs Prev Close (%)", color="white")
+    ax.set_xlabel("Time", color="white")
+    ax.set_ylabel("Change vs Prev Close (%)", color="white")
 
     fig.tight_layout()
-    fig.savefig(path, facecolor=fig.getfacecolor() if hasattr(fig, "getfacecolor") else "black",
-                bbox_inches="tight")
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
 
 
