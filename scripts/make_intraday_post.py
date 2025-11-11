@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-R-BANK9 intraday snapshot/post generator (robust final)
+R-BANK9 intraday snapshot/post generator (robust FINAL)
 
-対応フォーマット
-- 縦持ち:   ts,pct
-- 横持ち:   先頭行にティッカー/コメント、2 行目以降は
-            「時刻, 値, 値, …, #コメント, …」
-  ※ 2 列目がすでに集計値でも OK（2 列目以降の数値セルを平均。1 つならそのまま）
+対応:
+- 縦持ち: ts,pct
+- 横持ち/壊れやすいCSV:
+  - 区切りが , と 全角， 混在
+  - 先頭セルが空(NaN)
+  - 行内のどこかに時刻セルがあり、その後ろに数値が並ぶ
+  - コメントやティッカー/日本語が混在（数値以外は全無視）
 
-出力
-- docs/outputs/rbank9_intraday.png（ダークテーマ）
+出力（指数リポ内; workflow がサイトリポ docs/charts/R_BANK9/ にコピー）:
+- docs/outputs/rbank9_intraday.png
 - docs/outputs/rbank9_post_intraday.txt
 - docs/outputs/rbank9_stats.json
 """
@@ -19,13 +21,16 @@ R-BANK9 intraday snapshot/post generator (robust final)
 from __future__ import annotations
 from pathlib import Path
 import argparse
+import csv
 import json
-from typing import List
+import re
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+# 既定パス
 IN_CSV_DEF   = Path("docs/outputs/rbank9_intraday.csv")
 OUT_PNG_DEF  = Path("docs/outputs/rbank9_intraday.png")
 OUT_TXT_DEF  = Path("docs/outputs/rbank9_post_intraday.txt")
@@ -35,44 +40,57 @@ INDEX_KEY_DEF = "R_BANK9"
 LABEL_DEF     = "R-BANK9"
 TITLE         = "R-BANK9 Intraday Snapshot (JST)"
 
-# ---------------- args ----------------
+# 時刻セル検出用（例: 2025-11-11T09:05 / +09:00 はあってもなくてもOK）
+TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--csv",          default=str(IN_CSV_DEF))
     p.add_argument("--out-json",     dest="out_json",     default=str(OUT_STAT_DEF))
     p.add_argument("--out-text",     dest="out_text",     default=str(OUT_TXT_DEF))
     p.add_argument("--snapshot-png", dest="snapshot_png", default=str(OUT_PNG_DEF))
-    # 互換用（値は使わない・受け取るだけ）
+    # 互換用（受理のみ）
     p.add_argument("--index-key", default=None)
-    p.add_argument("--label", default=None)
-    p.add_argument("--dt-col", default=None)
-    p.add_argument("--value-type", default=None)
-    p.add_argument("--basis", default=None)
+    p.add_argument("--label",     default=None)
+    p.add_argument("--dt-col",    default=None)
+    p.add_argument("--value-type",default=None)
+    p.add_argument("--basis",     default=None)
     p.add_argument("--session-start", default=None)
-    p.add_argument("--session-end", default=None)
-    p.add_argument("--day-anchor", default=None)
+    p.add_argument("--session-end",   default=None)
+    p.add_argument("--day-anchor",    default=None)
     return p.parse_args()
 
-# ---------------- helpers ----------------
-def _clean_num(x: str) -> float | None:
-    if x is None:
+# ---------- 基本ユーティリティ ----------
+def _clean_num(tok: str) -> Optional[float]:
+    if tok is None:
         return None
-    s = str(x).strip()
-    if not s or s.lower() == "nan":
+    s = str(tok).strip().replace("，", ",")  # 全角カンマ->半角
+    if not s:
         return None
+    # パーセント/カンマ除去
     s = s.replace(",", "").replace("%", "")
     try:
-        return float(s)
+        v = float(s)
+        if np.isfinite(v):
+            return v
+        return None
     except Exception:
         return None
 
-def _read_text_lines(p: Path) -> List[str]:
-    txt = p.read_text(encoding="utf-8", errors="ignore").replace("\ufeff", "")
-    # 空行は除去、先頭のカンマ（空セル）は壊さないよう strip はしない
-    return [ln.rstrip("\r\n") for ln in txt.splitlines() if ln.strip()]
+def _to_ts(tok: str) -> Optional[pd.Timestamp]:
+    s = (tok or "").strip()
+    if not s or not TS_RE.search(s):
+        return None
+    try:
+        ts = pd.to_datetime(s, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
 
-# ---------------- readers ----------------
-def read_vertical(path: Path) -> pd.DataFrame | None:
+# ---------- 縦持ち ----------
+def read_vertical(path: Path) -> Optional[pd.DataFrame]:
     try:
         df = pd.read_csv(path)
     except Exception:
@@ -86,42 +104,50 @@ def read_vertical(path: Path) -> pd.DataFrame | None:
     df = df.dropna(subset=["ts","pct"]).sort_values("ts")
     return df if not df.empty else None
 
-def read_text_generic(path: Path) -> pd.DataFrame | None:
-    """先頭列=時刻、2 列目以降=“数値セルだけ”を拾って平均（1 つならそのまま）。"""
-    lines = _read_text_lines(path)
+# ---------- 横持ち/壊れ耐性 ----------
+def read_any_wide(path: Path) -> Optional[pd.DataFrame]:
+    rows_ts: List[pd.Timestamp] = []
+    rows_pct: List[float] = []
+
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        rdr = csv.reader((ln.replace("，", ",") for ln in f))  # 全角区切り→半角に正規化
+        lines = list(rdr)
+
     if len(lines) < 2:
         return None
 
-    ts_list: List[pd.Timestamp] = []
-    pct_list: List[float] = []
-
     # 1 行目はヘッダ（内容は使わない）
-    for ln in lines[1:]:
-        cells = [c.strip() for c in ln.split(",")]
-        if not cells:
+    for tokens in lines[1:]:
+        if not tokens:
             continue
-        ts_s = cells[0] if len(cells) > 0 else ""
-        ts = pd.to_datetime(ts_s, errors="coerce", utc=True)
-        if pd.isna(ts):
+        # 行内の「最初の時刻セル」を探す
+        ts_idx = None
+        ts_val = None
+        for i, tok in enumerate(tokens):
+            ts = _to_ts(tok)
+            if ts is not None:
+                ts_idx = i
+                ts_val = ts
+                break
+        if ts_idx is None:
             continue
 
-        nums = []
-        for c in cells[1:]:
-            v = _clean_num(c)
-            if v is not None and np.isfinite(v):
-                nums.append(float(v))
-
+        # 時刻セル以降の数値だけを拾って平均（1 つならそのまま）
+        nums: List[float] = []
+        for tok in tokens[ts_idx+1:]:
+            v = _clean_num(tok)
+            if v is not None:
+                nums.append(v)
         if not nums:
-            # 数値が 1 つもない行は無視
             continue
 
-        ts_list.append(ts)
-        pct_list.append(float(np.mean(nums)))  # 1 つならその値、複数なら平均
+        rows_ts.append(ts_val)  # UTC
+        rows_pct.append(float(np.mean(nums)))
 
-    if not ts_list:
+    if not rows_ts:
         return None
 
-    df = pd.DataFrame({"ts": ts_list, "pct": pct_list})
+    df = pd.DataFrame({"ts": rows_ts, "pct": rows_pct})
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("Asia/Tokyo")
     df = df.sort_values("ts")
     return df if not df.empty else None
@@ -129,25 +155,22 @@ def read_text_generic(path: Path) -> pd.DataFrame | None:
 def read_csv_any(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise ValueError(f"CSV がありません: {path}")
-
-    # 1) 縦持ち優先
+    # 1) 縦持ち
     df = read_vertical(path)
     if df is not None:
         return df
-
-    # 2) 横持ち/ゆるい形式
-    df = read_text_generic(path)
+    # 2) 横持ち/壊れ耐性
+    df = read_any_wide(path)
     if df is not None:
         return df
-
-    # 3) どうしても読めない時はプレビューを埋め込んで例外
+    # 3) 失敗時のプレビュー
     try:
-        preview = pd.read_csv(path, nrows=1, header=None).iloc[0].tolist()
+        prev = pd.read_csv(path, header=None, nrows=1).iloc[0].tolist()
     except Exception:
-        preview = "読み取り失敗"
-    raise ValueError(f"CSV 形式を解釈できません。先頭行={preview}")
+        prev = "読み取り失敗"
+    raise ValueError(f"CSV 形式を解釈できません。先頭行={prev}")
 
-# ---------------- plot ----------------
+# ---------- 描画（ダークテーマ） ----------
 def _setup_dark():
     plt.rcParams.update({
         "figure.facecolor": "#0b1420",
@@ -160,7 +183,7 @@ def _setup_dark():
         "ytick.color":      "#c8d7e2",
         "grid.color":       "#274057",
         "axes.grid":        True,
-        "grid.alpha":       0.6,
+        "grid.alpha":       0.55,
     })
 
 def plot_series(df: pd.DataFrame, out_png: Path):
@@ -169,7 +192,6 @@ def plot_series(df: pd.DataFrame, out_png: Path):
     ax.plot(df["ts"], df["pct"])
     ax.set_title(TITLE)
     ax.set_xlabel("Time")
-    ax.set_label = "Change vs Prev Close (%)"
     ax.set_ylabel("Change vs Prev Close (%)")
     for sp in ax.spines.values():
         sp.set_color("#36506b")
@@ -178,7 +200,7 @@ def plot_series(df: pd.DataFrame, out_png: Path):
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------- output ----------------
+# ---------- 出力 ----------
 def build_post_text(latest: float, label: str) -> str:
     sign = "+" if latest >= 0 else ""
     now_jst = pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y/%m/%d %H:%M JST")
@@ -190,34 +212,31 @@ def build_stats_json(latest: float, index_key: str, label: str) -> str:
         "label": label,
         "pct_intraday": latest,
         "basis": "prev_close",
-        "session": {"start": "09:00", "end": "15:30", "anchor": "09:00"},
+        "session": {"start":"09:00","end":"15:30","anchor":"09:00"},
         "updated_at": pd.Timestamp.now(tz="Asia/Tokyo").isoformat(),
     }
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
-# ---------------- main ----------------
+# ---------- main ----------
 def main():
     a = parse_args()
-    in_csv   = Path(a.csv) if a.csv else IN_CSV_DEF
+    in_csv   = Path(a.csv)          if a.csv          else IN_CSV_DEF
     out_png  = Path(a.snapshot_png) if a.snapshot_png else OUT_PNG_DEF
-    out_txt  = Path(a.out_text) if a.out_text else OUT_TXT_DEF
-    out_stat = Path(a.out_json) if a.out_json else OUT_STAT_DEF
+    out_txt  = Path(a.out_text)     if a.out_text     else OUT_TXT_DEF
+    out_stat = Path(a.out_json)     if a.out_json     else OUT_STAT_DEF
 
-    index_key = (a.index_key or INDEX_KEY_DEF)
-    label     = (a.label or LABEL_DEF)
+    index_key = a.index_key or INDEX_KEY_DEF
+    label     = a.label     or LABEL_DEF
 
     df = read_csv_any(in_csv)
     latest = float(df["pct"].iloc[-1])
 
     plot_series(df, out_png)
-
     out_txt.parent.mkdir(parents=True, exist_ok=True)
     out_txt.write_text(build_post_text(latest, label), encoding="utf-8")
-
     out_stat.parent.mkdir(parents=True, exist_ok=True)
     out_stat.write_text(build_stats_json(latest, index_key, label), encoding="utf-8")
-
-    print(f"[ok] rows={len(df)} latest={latest:.4f} file={out_png}")
+    print(f"[ok] rows={len(df)} latest={latest:.4f} -> {out_png}")
 
 if __name__ == "__main__":
     main()
