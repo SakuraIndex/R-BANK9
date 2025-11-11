@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-R-BANK9 intraday index snapshot
-
-- 9銘柄等ウェイトの前日終値比（%）を5分足で推定
-- 安全弁（±20%でクリップ）、共通グリッドに整列して ffill
+R-BANK9 intraday index snapshot (robust)
+- 9 銘柄を等ウェイト
+- yfinance 5m（7d window）から当日(JST)のみ抽出
+- 異常値を ±20% でクリップ
+- 共通グリッドに揃えて ffill
 - 出力:
-    docs/outputs/rbank9_intraday.csv        ... ts,pct の２列（JST, ISO8601, サイト用）
-    docs/outputs/rbank9_intraday_full.csv   ... デバッグ用（各銘柄列＋R_BANK9）
-    docs/outputs/rbank9_post_intraday.txt   ... 簡易テキスト
-    docs/outputs/rbank9_intraday.png        ... 参考用（リポ内表示向け）
+    ・docs/outputs/rbank9_intraday.csv   ... ts,pct（サイト側が読む形式）
+    ・docs/outputs/rbank9_intraday.png   ... 参考PNG（任意）
+    ・docs/outputs/rbank9_post_intraday.txt
+    ・docs/outputs/rbank9_stats.json     ... 補助（任意）
 """
 
-import os
-from typing import List, Dict
+from __future__ import annotations
+import os, json
+from typing import List, Dict, Optional
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -22,22 +24,18 @@ import matplotlib.pyplot as plt
 # ---------- 設定 ----------
 BASE_TZ = timezone(timedelta(hours=9))  # JST
 OUT_DIR = "docs/outputs"
-TICKER_FILE = "docs/tickers_rbank9.txt"   # 5830.T などを1行1ティッカー
+TICKER_FILE = "docs/tickers_rbank9.txt"   # 5830.T などが1行1ティッカー
 
-PNG_PATH = os.path.join(OUT_DIR, "rbank9_intraday.png")
-CSV_SITE = os.path.join(OUT_DIR, "rbank9_intraday.csv")         # ← ts,pct（サイトが読む）
-CSV_FULL = os.path.join(OUT_DIR, "rbank9_intraday_full.csv")    # ← 多列（デバッグ）
-
+TS_CSV = os.path.join(OUT_DIR, "rbank9_intraday.csv")      # ts,pct（サイト用）
+IMG_PATH = os.path.join(OUT_DIR, "rbank9_intraday.png")    # 参考画像
 POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
+STATS_JSON = os.path.join(OUT_DIR, "rbank9_stats.json")
 
-# JP は 1m が不安定なことがあるので 5m で安定運用
 INTRA_PERIOD = "7d"
 INTRA_INTERVAL = "5m"
 
-# クリップ（安全弁）
 PCT_CLIP_LOW = -20.0
 PCT_CLIP_HIGH = 20.0
-
 
 # ---------- ユーティリティ ----------
 def jst_now() -> datetime:
@@ -51,169 +49,165 @@ def load_tickers(path: str) -> List[str]:
             if not s or s.startswith("#"):
                 continue
             xs.append(s)
+    if not xs:
+        raise RuntimeError("ティッカーリストが空です")
     return xs
 
-def _to_series_1d(close_like: pd.DataFrame | pd.Series, index) -> pd.Series:
-    """yfinance の Close を 1 次元 Series[float] に正規化"""
-    if isinstance(close_like, pd.Series):
-        ser = pd.to_numeric(close_like, errors="coerce").dropna()
-        return ser
-
-    df = close_like.apply(pd.to_numeric, errors="coerce")
-    mask = df.notna().any(axis=0)
-    df = df.loc[:, mask]
-
-    if df.shape[1] == 0:
-        raise ValueError("no numeric close column")
-
-    if df.shape[1] == 1:
-        ser = df.iloc[:, 0]
-    else:
-        best_col = df.count(axis=0).idxmax()
-        ser = df[best_col]
-
-    ser = ser.astype(float)
-    ser.index = index
-    ser = ser.dropna()
-    return ser
-
-def ensure_series_1dClose(df: pd.DataFrame) -> pd.Series:
+def _ensure_series_1d_close(df: pd.DataFrame) -> pd.Series:
     if "Close" not in df.columns:
         raise ValueError("Close column not found")
     close = df["Close"]
-    return _to_series_1d(close, df.index)
+    if isinstance(close, pd.Series):
+        return pd.to_numeric(close, errors="coerce").dropna()
+    d2 = close.apply(pd.to_numeric, errors="coerce")
+    d2 = d2.loc[:, d2.notna().any(axis=0)]
+    if d2.shape[1] == 0:
+        raise ValueError("no numeric close column")
+    if d2.shape[1] == 1:
+        ser = d2.iloc[:, 0]
+    else:
+        ser = d2[d2.count(axis=0).idxmax()]
+    return ser.dropna().astype(float)
 
-def fetch_prev_close(ticker: str) -> float:
+def _download_prev_close(ticker: str) -> Optional[float]:
     d = yf.download(ticker, period="10d", interval="1d",
                     auto_adjust=False, progress=False)
     if d.empty:
-        raise RuntimeError(f"[WARN] prev close empty for {ticker}")
-    s = ensure_series_1dClose(d)
-    if len(s) >= 2:
-        return float(s.iloc[-2])
-    return float(s.iloc[-1])
+        return None
+    s = _ensure_series_1d_close(d)
+    if s.empty:
+        return None
+    return float(s.iloc[-2] if len(s) >= 2 else s.iloc[-1])
 
-def fetch_intraday_series(ticker: str) -> pd.Series:
+def _download_intraday_today(ticker: str) -> pd.Series:
     d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
                     auto_adjust=False, progress=False)
     if d.empty:
-        raise RuntimeError(f"[WARN] intraday empty for {ticker}")
-    s = ensure_series_1dClose(d)
-
-    # 当日(JST)だけ抽出
+        return pd.Series(dtype=float)
+    s = _ensure_series_1d_close(d)
     idx = pd.to_datetime(s.index)
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
-    idx = idx.tz_convert("Asia/Tokyo")
-    last_day = idx[-1].date()
+    idx = idx.tz_convert(BASE_TZ)
     s = pd.Series(s.values, index=idx)
-    s = s[(s.index.date == last_day)]
     if s.empty:
-        raise RuntimeError(f"[WARN] intraday filtered empty for {ticker}")
+        return pd.Series(dtype=float)
+    # 直近セッション日に限定（場外でも最新日の当日分が取れる）
+    last_day = idx[-1].date()
+    s = s[s.index.date == last_day]
     return s
 
 # ---------- 指数構築 ----------
-def build_equal_weight_index(tickers: List[str]) -> pd.DataFrame:
-    indiv_pct: Dict[str, pd.Series] = {}
+def build_equal_weight_index(tickers: List[str]) -> pd.Series:
+    indiv: Dict[str, pd.Series] = {}
     last_times: List[pd.Timestamp] = []
 
     for t in tickers:
         try:
-            print(f"[INFO] Fetching {t} ...")
-            prev = fetch_prev_close(t)
-            intraday = fetch_intraday_series(t)
+            prev = _download_prev_close(t)
+            intraday = _download_intraday_today(t)
+            if prev is None or intraday.empty:
+                print(f"[WARN] skip {t} (prev or intraday empty)")
+                continue
             pct = (intraday / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
-            indiv_pct[t] = pct.rename(t)
+            indiv[t] = pct.rename(t)
             last_times.append(pct.index.max())
         except Exception as e:
             print(f"[WARN] skip {t}  # {e}")
 
-    if not indiv_pct:
-        raise RuntimeError("取得できた日中データが0でした。ティッカーを見直してください。")
+    if not indiv:
+        return pd.Series(dtype=float)
 
-    # 共通に揃う終了時刻（全銘柄の最終TSの最小値）
+    # 共通終了時刻
     common_end = min(last_times)
-    start_time = min(s.index.min() for s in indiv_pct.values())
-
+    start_time = min(s.index.min() for s in indiv.values())
     grid = pd.date_range(start=start_time, end=common_end,
-                         freq=INTRA_INTERVAL, tz="Asia/Tokyo")
+                         freq=INTRA_INTERVAL, tz=BASE_TZ)
 
     aligned = []
-    for t, ser in indiv_pct.items():
+    for t, ser in indiv.items():
         s2 = ser.reindex(grid).ffill()
         aligned.append(s2.rename(t))
-
     df = pd.concat(aligned, axis=1)
-    df["R_BANK9"] = df.mean(axis=1, skipna=True)
-    df = df.sort_index()
-    return df
+    series = df.mean(axis=1, skipna=True).rename("R_BANK9")
+    return series.dropna()
 
-# ---------- 保存系 ----------
-def save_csvs(df: pd.DataFrame) -> None:
+# ---------- 出力 ----------
+def save_ts_pct(series: pd.Series) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-
-    # 1) サイト用（ts,pct）
-    s = df["R_BANK9"].dropna()
-    site = pd.DataFrame({
-        "ts": s.index.tz_convert("Asia/Tokyo").astype("datetime64[ns, Asia/Tokyo]"),
-        "pct": s.values
+    if series is None or series.empty:
+        # 空でもヘッダだけ書く（サイト側が no data を描ける）
+        with open(TS_CSV, "w", encoding="utf-8") as f:
+            f.write("ts,pct\n")
+        return
+    d = pd.DataFrame({
+        "ts": series.index.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pct": series.values
     })
-    # ISO8601(+09:00)で保存
-    site["ts"] = site["ts"].dt.tz_convert("Asia/Tokyo").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
-    # +0900 -> +09:00 へ整形
-    site["ts"] = site["ts"].str.replace(r"(\+|\-)(\d{2})(\d{2})$", r"\1\2:\3", regex=True)
-    site.to_csv(CSV_SITE, index=False, header=False, encoding="utf-8")
+    d.to_csv(TS_CSV, index=False, encoding="utf-8")
 
-    # 2) デバッグ用フル（各銘柄＋R_BANK9）
-    df.to_csv(CSV_FULL, encoding="utf-8")
-
-def save_post_text(df: pd.DataFrame) -> None:
-    last = float(df["R_BANK9"].iloc[-1])
-    sign = "🔺" if last >= 0 else "🔻"
-    with open(POST_PATH, "w", encoding="utf-8") as f:
-        f.write(
-            f"{sign} R-BANK9 日中スナップショット（{jst_now().strftime('%Y/%m/%d %H:%M')} JST）\n"
-            f"{last:+.2f}%（前日終値比）\n"
-            f"※ 構成9銘柄の等ウェイト\n"
-            f"#地方銀行 #R_BANK9 #日本株\n"
-        )
-
-def plot_index(df: pd.DataFrame) -> None:
+def plot_reference_png(series: pd.Series) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-    series = df["R_BANK9"]
-    c = "#00e5d7" if float(series.iloc[-1]) >= 0 else "#ff4d4d"
-
     plt.close("all")
     fig = plt.figure(figsize=(16, 9), dpi=160)
     ax = fig.add_subplot(111)
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
     for sp in ax.spines.values():
-        sp.set_color("#444444")
-    ax.plot(series.index, series.values, color=c, linewidth=3.0, label="R-BANK9")
-    ax.axhline(0, color="#666666", linewidth=1.0)
+        sp.set_color("#444")
+    if series is not None and not series.empty:
+        c = "#00e5d7" if float(series.iloc[-1]) >= 0 else "#ff4d4d"
+        ax.plot(series.index, series.values, color=c, linewidth=2.2, label="R-BANK9")
+    ax.axhline(0, color="#666", linewidth=1.0)
     ax.tick_params(colors="white")
-    ax.set_title(
-        f"R-BANK9 Intraday Snapshot ({jst_now().strftime('%Y/%m/%d %H:%M')} JST)",
-        color="white", fontsize=22, pad=12
-    )
+    ax.set_title(f"R-BANK9 Intraday Snapshot ({jst_now().strftime('%Y/%m/%d %H:%M')})",
+                 color="white", fontsize=20, pad=10)
     ax.set_xlabel("Time", color="white")
     ax.set_ylabel("Change vs Prev Close (%)", color="white")
-    ax.legend(facecolor="black", edgecolor="#444444", labelcolor="white", loc="upper left")
+    ax.legend(facecolor="black", edgecolor="#444", labelcolor="white", loc="upper left")
     fig.tight_layout()
-    plt.savefig(PNG_PATH, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.savefig(IMG_PATH, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
 
+def save_post(series: pd.Series) -> None:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if series is None or series.empty:
+        txt = "▲ R-BANK9 日中スナップショット（no data）\n+0.00%（前日終値比）\n#地方銀行 #R_BANK9 #日本株\n"
+    else:
+        v = float(series.iloc[-1])
+        sign = "🔺" if v >= 0 else "🔻"
+        txt = (f"{sign} R-BANK9 日中スナップショット（{jst_now().strftime('%Y/%m/%d %H:%M')}）\n"
+               f"{v:+.2f}%（前日終値比）\n"
+               f"※ 構成9銘柄の等ウェイト\n"
+               f"#地方銀行 #R_BANK9 #日本株\n")
+    with open(POST_PATH, "w", encoding="utf-8") as f:
+        f.write(txt)
+
+def save_stats(series: pd.Series) -> None:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    val = 0.0 if series is None or series.empty else float(series.iloc[-1])
+    payload = {
+        "index_key": "rbank9",
+        "label": "R-BANK9",
+        "pct_intraday": val,
+        "updated_at": jst_now().isoformat()
+    }
+    with open(STATS_JSON, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 # ---------- メイン ----------
 def main():
     tickers = load_tickers(TICKER_FILE)
-    print("[INFO] Building R_BANK9 intraday index ...")
-    df = build_equal_weight_index(tickers)
-    save_csvs(df)          # ← サイト用 ts,pct を書く
-    plot_index(df)         # 参考PNG
-    save_post_text(df)     # 参考TXT
+    print("[INFO] Building R_BANK9 intraday ...")
+    series = build_equal_weight_index(tickers)
+
+    # ts,pct（サイトが読む CSV）
+    save_ts_pct(series)
+    # 参考PNG / 投稿文 / stats
+    plot_reference_png(series)
+    save_post(series)
+    save_stats(series)
     print("[INFO] done.")
 
 if __name__ == "__main__":
