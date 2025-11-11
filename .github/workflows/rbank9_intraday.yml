@@ -8,8 +8,9 @@ on:
       day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
       value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
+  # スケジュール実行したい場合は下を有効化（JST 9:00–15:30 を 5 分間隔）
   # schedule:
-  #   - cron: "*/15 0-6 * * 1-5"   # JST 09:00-15:30
+  #   - cron: "*/5 0-6 * * 1-5"
 
 permissions:
   contents: write
@@ -19,23 +20,17 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 固有設定（入力は指数リポ側 docs/outputs ）
+  # 入力CSV（指数リポの docs/outputs にある ts,pct 形式）
+  CSV: docs/outputs/rbank9_intraday.csv
+  DT_COL: ts
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
-  CSV: docs/outputs/rbank9_intraday.csv
-  BASIS_DEFAULT: prev_close
-  VALUE_TYPE_DEFAULT: auto
 
-  # 公開サイト（出力はサイトリポ側 docs/charts/R_BANK9）
+  # 公開先（サイトリポ）
   SITE_REPO: SakuraIndex/Sakura-Index-Site
   SITE_BRANCH: main
   PUBLISH_DIR: docs/charts/R_BANK9
   PUBLISH_TOKEN: ${{ secrets.SITE_PAT || secrets.SITE_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
-
-  # このリポ内の一時出力（のちにサイトへコピー）
-  OUT_JSON: docs/outputs/rbank9_stats.json
-  OUT_TEXT: docs/outputs/rbank9_post_intraday.txt
-  OUT_PNG:  docs/outputs/rbank9_intraday.png
 
 jobs:
   build:
@@ -53,41 +48,39 @@ jobs:
 
       - name: Install deps
         run: |
-          set -e
           python -m pip install -U pip
           python -m pip install pandas matplotlib pytz
 
       - name: Verify inputs & files (non-fatal)
+        id: verify
+        continue-on-error: true
         run: |
           set -e
-          test -f "${CSV}" || (echo "❌ Missing CSV: ${CSV}" && exit 1)
-          test -f scripts/make_intraday_post.py || (echo "❌ Missing script: scripts/make_intraday_post.py" && exit 1)
           echo "== csv head =="
-          head -n 5 "${CSV}" || true
+          head -n 20 "${CSV}" || true
 
       - name: Generate intraday snapshot (JST)
         env:
           SESSION_START: ${{ inputs.session_start || '09:00' }}
           SESSION_END:   ${{ inputs.session_end   || '15:30' }}
           DAY_ANCHOR:    ${{ inputs.day_anchor    || '09:00' }}
-          BASIS:         ${{ inputs.basis         || env.BASIS_DEFAULT }}
-          VALUE_TYPE_IN: ${{ inputs.value_type    || env.VALUE_TYPE_DEFAULT }}
+          BASIS:         ${{ inputs.basis         || 'prev_close' }}
+          VALUE_TYPE_IN: ${{ inputs.value_type    || 'auto' }}
         run: |
           set -euo pipefail
           echo "=== Generate ${LABEL} intraday ==="
           python scripts/make_intraday_post.py \
             --csv "${CSV}" \
-            --out-json "${OUT_JSON}" \
-            --out-text "${OUT_TEXT}" \
-            --snapshot-png "${OUT_PNG}" \
             --label "${LABEL}" \
             --index-key "${INDEX_KEY}" \
+            --basis "${BASIS}" \
             --session-start "${SESSION_START}" \
-            --session-end   "${SESSION_END}" \
-            --day-anchor    "${DAY_ANCHOR}" \
-            --basis         "${BASIS}" \
-            --value-type    "${VALUE_TYPE_IN}"
-          ls -l "${OUT_JSON}" "${OUT_TEXT}" "${OUT_PNG}"
+            --session-end "${SESSION_END}" \
+            --day-anchor "${DAY_ANCHOR}" \
+            --value-type "${VALUE_TYPE_IN}" \
+            --out-json "site_stats.json" \
+            --out-text "site_post.txt" \
+            --snapshot-png "site_intraday.png"
 
       - name: Checkout site repo
         uses: actions/checkout@v4
@@ -98,14 +91,14 @@ jobs:
           path: site
           fetch-depth: 0
 
-      - name: Copy into site tree (canonical names)
+      - name: Copy into site tree
         run: |
           set -e
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          cp -f "${OUT_JSON}" "${dst}/stats.json"
-          cp -f "${OUT_TEXT}" "${dst}/post_intraday.txt"
-          cp -f "${OUT_PNG}"  "${dst}/intraday.png"
+          cp -f site_stats.json "${dst}/stats.json"
+          cp -f site_post.txt  "${dst}/post_intraday.txt"
+          cp -f site_intraday.png "${dst}/intraday.png"
           ls -l "${dst}"
 
       - name: Commit & push site charts
@@ -118,6 +111,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes for site."
           else
-            git commit -m "Update R-BANK9 intraday charts ($(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M JST'))"
+            git commit -m "Update R-BANK9 intraday charts ($(date '+%Y-%m-%d %H:%M JST'))"
             git push origin "${SITE_BRANCH}"
           fi
