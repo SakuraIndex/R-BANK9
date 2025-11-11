@@ -1,7 +1,7 @@
 name: R-BANK9 • long charts & intraday percent (JST 09:00–15:30)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -11,12 +11,23 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  INDEX_KEY: rbank9
+  # このワークフローは “指数リポ内の docs/outputs” を更新する役割
   OUT_DIR: docs/outputs
-  # 表示用のセッション表記（スクリプト側で使わなくても可）
+
+  # intraday 系（ファイル名は既存に合わせて小文字）
+  INTRA_CSV: rbank9_intraday.csv
+  INTRA_PNG: rbank9_intraday.png
+  POST_TXT:  rbank9_post_intraday.txt
+  STATS_JSON: rbank9_stats.json
+
+  # 表示用とメタ（make_intraday_post.py に渡す）
+  INDEX_KEY: R_BANK9
+  LABEL: R-BANK9
   SESSION_START: "09:00"
-  SESSION_END: "15:30"
-  TIMEZONE: "Asia/Tokyo"
+  SESSION_END:   "15:30"
+  DAY_ANCHOR:    "09:00"
+  BASIS:         "prev_close"
+  TIMEZONE:      "Asia/Tokyo"
 
 jobs:
   build:
@@ -39,6 +50,8 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 念のため（requirements に無い場合の保険）
+          python -m pip install pandas matplotlib pytz
           python - <<'PY'
           import sys, matplotlib
           print("=== DIAG ===")
@@ -46,7 +59,7 @@ jobs:
           print("Matplotlib:", getattr(matplotlib, "__version__", "n/a"))
           PY
 
-      # ───────── チャート生成（1d/7d/1m/1y） ─────────
+      # ───────── 長期チャート生成（1d/7d/1m/1y） ─────────
       - name: Ensure plotting script exists
         run: |
           test -f scripts/long_charts.py || (echo "scripts/long_charts.py NOT FOUND" && exit 2)
@@ -60,23 +73,36 @@ jobs:
       - name: Check outputs after plotting
         run: |
           set -euxo pipefail
-          ls -la ${OUT_DIR} || true
+          ls -la "${OUT_DIR}" || true
           git status --porcelain || true
 
-      # ───────── 1d 騰落率（寄り or 安定点/自動） ─────────
-      # 既存の intraday CSV があるときだけ上書き（なければスキップ）
-      - name: Override with intraday.csv (session-based)
+      # ───────── intraday がある場合のみ、PNG/POST/STATS を docs/outputs に再生成 ─────────
+      - name: Build intraday artifacts (if CSV exists)
         run: |
           set -euxo pipefail
-          if [ -f "${OUT_DIR}/${INDEX_KEY}_intraday.csv" ]; then
-            echo "=== intraday override ==="
+          CSV_PATH="${OUT_DIR}/${INTRA_CSV}"
+          if [ -f "${CSV_PATH}" ]; then
+            echo "=== intraday CSV found: ${CSV_PATH}"
+            head -n 5 "${CSV_PATH}" || true
+
             python scripts/make_intraday_post.py \
+              --csv "${CSV_PATH}" \
+              --label "${LABEL}" \
               --index-key "${INDEX_KEY}" \
-              --csv "${OUT_DIR}/${INDEX_KEY}_intraday.csv" \
-              --out-json "${OUT_DIR}/${INDEX_KEY}_stats.json" \
-              --out-text "${OUT_DIR}/${INDEX_KEY}_post_intraday.txt"
+              --basis "${BASIS}" \
+              --session-start "${SESSION_START}" \
+              --session-end   "${SESSION_END}" \
+              --day-anchor    "${DAY_ANCHOR}" \
+              --value-type    "auto" \
+              --out-json "${OUT_DIR}/${STATS_JSON}" \
+              --out-text "${OUT_DIR}/${POST_TXT}" \
+              --snapshot-png "${OUT_DIR}/${INTRA_PNG}"
+
+            ls -l "${OUT_DIR}/${INTRA_PNG}"   || true
+            ls -l "${OUT_DIR}/${POST_TXT}"    || true
+            ls -l "${OUT_DIR}/${STATS_JSON}"  || true
           else
-            echo "No intraday.csv; keep previous stats."
+            echo "No intraday CSV found (${CSV_PATH}). Skip intraday artifacts."
           fi
 
       - name: Upload artifacts (for debug)
@@ -97,7 +123,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A docs/outputs
           if ! git diff --cached --quiet; then
-            git commit -m "chore(charts): update ${INDEX_KEY} (1d/7d/1m/1y + stats + intraday, JST 09:00–15:30)"
+            git commit -m "chore(charts): update R-BANK9 (1d/7d/1m/1y + intraday artifacts, JST)"
             git push
           else
             echo "No changes to commit."
