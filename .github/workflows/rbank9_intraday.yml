@@ -8,7 +8,7 @@ on:
       day_anchor:    { description: "Day anchor time (HH:MM JST)", required: true, default: "09:00" }
       basis:         { description: "Return basis label", required: true, default: "prev_close" }
       value_type:    { description: "auto | ratio | percent", required: false, default: "auto" }
-  # スケジュール実行したい場合は下を有効化（JST 9:00–15:30 を 5 分間隔）
+  # JST 9:00–15:30 の 5分間隔で定期実行したい場合：
   # schedule:
   #   - cron: "*/5 0-6 * * 1-5"
 
@@ -22,7 +22,6 @@ concurrency:
 env:
   # 入力CSV（指数リポの docs/outputs にある ts,pct 形式）
   CSV: docs/outputs/rbank9_intraday.csv
-  DT_COL: ts
   INDEX_KEY: R_BANK9
   LABEL: R-BANK9
 
@@ -40,11 +39,13 @@ jobs:
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -56,8 +57,11 @@ jobs:
         continue-on-error: true
         run: |
           set -e
+          echo "== csv path ==" && echo "${CSV}"
           echo "== csv head =="
-          head -n 20 "${CSV}" || true
+          (head -n 20 "${CSV}" || true)
+          echo "== history head =="
+          (head -n 20 "$(dirname "${CSV}")/rbank9_history.csv" || true)
 
       - name: Generate intraday snapshot (JST)
         env:
@@ -75,12 +79,13 @@ jobs:
             --index-key "${INDEX_KEY}" \
             --basis "${BASIS}" \
             --session-start "${SESSION_START}" \
-            --session-end "${SESSION_END}" \
-            --day-anchor "${DAY_ANCHOR}" \
-            --value-type "${VALUE_TYPE_IN}" \
-            --out-json "site_stats.json" \
-            --out-text "site_post.txt" \
-            --snapshot-png "site_intraday.png"
+            --session-end   "${SESSION_END}" \
+            --day-anchor    "${DAY_ANCHOR}" \
+            --value-type    "${VALUE_TYPE_IN}" \
+            --out-json      "site_stats.json" \
+            --out-text      "site_post.txt" \
+            --snapshot-png  "site_intraday.png"
+          ls -l site_*.json site_*.txt site_*.png
 
       - name: Checkout site repo
         uses: actions/checkout@v4
@@ -96,9 +101,10 @@ jobs:
           set -e
           dst="site/${PUBLISH_DIR}"
           mkdir -p "${dst}"
-          cp -f site_stats.json "${dst}/stats.json"
-          cp -f site_post.txt  "${dst}/post_intraday.txt"
-          cp -f site_intraday.png "${dst}/intraday.png"
+          cp -f site_stats.json     "${dst}/stats.json"
+          cp -f site_post.txt       "${dst}/post_intraday.txt"
+          cp -f site_intraday.png   "${dst}/intraday.png"
+          echo "== published files =="
           ls -l "${dst}"
 
       - name: Commit & push site charts
