@@ -1,0 +1,25 @@
+{
+  "index_key": "R_BANK9",
+  "label": "R-BANK9",
+  "category": "地方銀行",
+  "description": "日本の主要地銀9銘柄で構成する等ウェイト指数。日中は前日終値比（％）で推移を可視化。",
+  "methodology": {
+    "universe": "日本の上場地方銀行・地銀グループ",
+    "weighting": "等ウェイト（9銘柄の単純平均）",
+    "calc_basis": "prev_close（前日終値比, ％）",
+    "intraday_source": "各構成銘柄の5分足終値（JST）",
+    "rebalancing": "随時（統合・指定替え・流動性変化等で見直し）",
+    "notes": "可視化の観点から極端値は±25%でクリップ。"
+  },
+  "constituents": [
+    { "ticker": "5830.T", "name": "いよぎんホールディングス" },
+    { "ticker": "5831.T", "name": "静岡フィナンシャルグループ" },
+    { "ticker": "5844.T", "name": "京都フィナンシャルグループ" },
+    { "ticker": "7167.T", "name": "めぶきフィナンシャルグループ" },
+    { "ticker": "7186.T", "name": "横浜フィナンシャルグループ" },
+    { "ticker": "8331.T", "name": "千葉銀行" },
+    { "ticker": "7173.T", "name": "東京きらぼしフィナンシャルグループ" },
+    { "ticker": "7180.T", "name": "九州フィナンシャルグループ" },
+    { "ticker": "7184.T", "name": "富山第一銀行" }
+  ]
+}
