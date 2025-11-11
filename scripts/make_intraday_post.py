@@ -70,22 +70,15 @@ def parse_args() -> Args:
     )
 
 
-# ---------- Datetime parsing (robust for JST-naive) ----------
+# ---------- Datetime parsing (JST-naive を JST とみなす) ----------
 
 def _parse_to_jst(series: pd.Series) -> Optional[pd.DatetimeIndex]:
-    """Parse a datetime-like series and return tz-aware JST index.
-    - If the parsed datetimes are tz-naive => treat as JST and tz_localize(JST)
-    - If tz-aware => tz_convert(JST)
-    Return None if parsing fails (all NaT).
-    """
     ts = pd.to_datetime(series, errors="coerce", utc=False)
-    if ts.isna().all():
+    if ts is None or ts.isna().all():
         return None
     if getattr(ts.dt, "tz", None) is None:
-        # Naive → すでに JST とみなしてローカライズ
         ts = ts.dt.tz_localize(JST, nonexistent="shift_forward", ambiguous="NaT")
     else:
-        # tz あり（UTC 等）→ JST へ変換
         ts = ts.dt.tz_convert(JST)
     return pd.DatetimeIndex(ts)
 
@@ -96,26 +89,29 @@ def _try_parse_dt_col(df: pd.DataFrame, col: str) -> Optional[pd.DatetimeIndex]:
     return None
 
 
-def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, str]:
-    # 1) 先頭列を優先
+def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, Optional[str]]:
+    if df.shape[1] == 0:
+        # 列すら無い（完全に空）とき
+        return pd.DatetimeIndex([], tz=JST), None
     first = df.columns[0]
     ts = _parse_to_jst(df[first])
     if ts is not None and ts.notna().any():
         return ts, first
-    # 2) 全列走査
     for c in df.columns:
         ts = _parse_to_jst(df[c])
         if ts is not None and ts.notna().any():
             return ts, c
-    raise TypeError("Datetime index が取得できません。CSV の先頭行/列をご確認ください。")
+    # 行はあるが日時列が見つからないとき
+    return pd.DatetimeIndex([], tz=JST), None
 
 
 def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    if df.empty:
-        raise ValueError("CSV が空です。")
+    # 行が 0 の場合もエラーにせず空 DataFrame を返す
+    if df.shape[0] == 0:
+        print("[warn] CSV has no rows. Proceeding with empty dataframe.")
+        return pd.DataFrame(index=pd.DatetimeIndex([], tz=JST))
 
-    # Datetime index 化（指定→自動検出）
     idx: Optional[pd.DatetimeIndex] = None
     used_col: Optional[str] = None
     if prefer_col and prefer_col in df.columns:
@@ -133,11 +129,14 @@ def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # 並び替え・重複除去
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(JST)
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
     print(f"[read_csv] columns={list(df.columns)}  rows={len(df)}  used_dt_col={used_col}")
-    print(f"[read_csv] time sample: {df.index.min()}  ..  {df.index.max()}")
+    if len(df):
+        print(f"[read_csv] time sample: {df.index.min()}  ..  {df.index.max()}")
     return df
 
 
@@ -152,19 +151,13 @@ def _slice_window(df_jst: pd.DataFrame, day_ts: pd.Timestamp, start_hm: str, end
 def _session_slice_with_fallbacks(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
     if df_jst.empty:
         return df_jst
-
     last_ts = df_jst.index[-1]
-    # 1) 正規の 09:00–15:30（など）
     df = _slice_window(df_jst, last_ts, start_hm, end_hm)
     if not df.empty:
         return df
-
-    # 2) 08:00–16:00 フォールバック（JST-naive→UTC 扱いだったデータ対策の緩衝）
     df = _slice_window(df_jst, last_ts, "08:00", "16:00")
     if not df.empty:
         return df
-
-    # 3) 末尾から 120 本（最大 2 時間相当を想定）
     return df_jst.tail(120)
 
 
@@ -173,18 +166,10 @@ def _detect_unit_is_ratio(df: pd.DataFrame) -> bool:
     vals = vals[~np.isnan(vals)]
     if vals.size == 0:
         return False
-    # だいたいのスケール判定：95%点が0.5未満 → ratio（= 0.5%未満が多い）
     return float(np.quantile(np.abs(vals), 0.95)) < 0.5
 
 
 def _to_percent_series(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
-    """
-    df_session: セッション内の DataFrame
-    優先度:
-      1) 列名が index_key そのもの（例: 'R_BANK9' / 'R-BANK9'）ならその列を採用
-      2) それが無ければ、数値列のみ等加重平均で算出（単位を ratio→percent に補正）
-    返り値: ％（percent）単位の時系列
-    """
     if df_session.empty:
         return pd.Series(dtype=float)
 
@@ -204,7 +189,7 @@ def _to_percent_series(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
         unit = "ratio" if _detect_unit_is_ratio(dfn) else "percent"
 
     if unit == "ratio":
-        dfn = dfn * 100.0  # ratio→％
+        dfn = dfn * 100.0
 
     s = dfn.mean(axis=1, skipna=True)
     s = s.clip(lower=-25.0, upper=25.0)
@@ -230,11 +215,11 @@ def _save_json(path: Path, index_key: str, label: str, pct_last_percent: float,
                basis: str, start_hm: str, end_hm: str, anchor_hm: str,
                now_ts_jst: pd.Timestamp) -> None:
     import json
-    pct_ratio = float(np.round(pct_last_percent / 100.0, 6))  # ratio（小数）
+    pct_ratio = float(np.round(pct_last_percent / 100.0, 6))
     payload = {
         "index_key": index_key,
         "label": label,
-        "pct_intraday": pct_ratio,  # 例: -0.0027 (= -0.27%)
+        "pct_intraday": pct_ratio,
         "basis": basis,
         "session": {"start": start_hm, "end": end_hm, "anchor": anchor_hm},
         "updated_at": now_ts_jst.isoformat(),
@@ -275,7 +260,7 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
     ax.tick_params(colors="#AAB8C2")
 
     fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.getFacecolor(), edgecolor="none")
     plt.close(fig)
 
 
