@@ -8,8 +8,8 @@ R-BANK9 intraday index snapshot (equal-weight, vs prev close, percent)
 - 共通 5 分グリッドに reindex + ffill で整列
 - クリップで異常値を抑制
 - 出力: docs/outputs/rbank9_intraday.csv (ts,pct)
-      docs/outputs/rbank9_intraday.png（簡易デバッグ用）
-      docs/outputs/rbank9_post_intraday.txt（簡易ポスト文）
+        docs/outputs/rbank9_intraday.png（デバッグ）
+        docs/outputs/rbank9_post_intraday.txt（簡易ポスト文）
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
 
 # JP は 1m が不安定なことがあるので 5m
 INTRA_INTERVAL = "5m"
-INTRA_PERIOD   = "3d"   # 直近 3 営業日あれば十分
+INTRA_PERIOD   = "3d"   # 直近 3 営業日
 
 # 安全弁（%）
 PCT_CLIP_LOW  = -20.0
@@ -50,13 +50,23 @@ def jst_now() -> datetime:
 
 
 def load_tickers(path: str) -> List[str]:
+    """
+    行内コメント「# ...」や余分な空白を除去して先頭トークンだけをティッカーとして採用。
+    例) "5830.T  # いよぎん" → "5830.T"
+    """
     xs: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             s = raw.strip()
             if not s or s.startswith("#"):
                 continue
-            xs.append(s)
+            # 行内コメント除去 → 先頭トークン
+            s = s.split("#", 1)[0].strip()
+            if not s:
+                continue
+            s = s.split()[0].strip().strip(",;")
+            if s:
+                xs.append(s)
     if not xs:
         raise RuntimeError("No tickers in docs/tickers_rbank9.txt")
     return xs
@@ -100,7 +110,7 @@ def fetch_prev_close(ticker: str, day: datetime.date) -> float:
     """
     指定した銘柄の「指定取引日の前日終値」を取得。
     """
-    d = yf.download(ticker, period="5d", interval="1d", auto_adjust=False, progress=False)
+    d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"prev close empty for {ticker}")
 
@@ -136,23 +146,6 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
     return s
 
 
-def pick_probe_series(tickers: List[str]) -> pd.Series:
-    """
-    複数ティッカーを試し、最初に成功した intraday Series を返す。
-    404/No data など一時障害があっても全滅でなければ継続。
-    """
-    last_err = None
-    for t in tickers:
-        try:
-            s = fetch_intraday_series(t)
-            if not s.empty:
-                return s
-        except Exception as e:
-            last_err = e
-            print(f"[WARN] probe failed for {t}  # {e}")
-    raise RuntimeError(f"probe failed for all tickers; last error: {last_err}")
-
-
 def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
@@ -161,8 +154,8 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     indiv_pct: Dict[str, pd.Series] = {}
 
-    # まずプローブで「直近の取引日」を決める（複数試行で堅牢化）
-    probe = pick_probe_series(tickers)
+    # まず 1 銘柄で「直近の取引日」を決める
+    probe = fetch_intraday_series(tickers[0])
     day = last_trading_day(probe.index)  # JST の直近取引日
 
     # その日のセッション時間帯だけを使う
@@ -174,9 +167,9 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             x = s[(s.index.date == d2)]
         return x
 
-    # 共通のグリッド（5m）を作る（tzinfo= は使わず tz_localize で付与）
-    grid_start = pd.Timestamp(datetime.combine(day, SESSION_START)).tz_localize(JST)
-    grid_end   = pd.Timestamp(datetime.combine(day, SESSION_END)).tz_localize(JST)
+    # 共通のグリッド（5m）: pandas は combine(tzinfo=...) を持たない版があるため tz_localize を使う
+    grid_start = pd.Timestamp.combine(day, SESSION_START).tz_localize(JST)
+    grid_end   = pd.Timestamp.combine(day, SESSION_END).tz_localize(JST)
     grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST)
 
     for t in tickers:
@@ -208,15 +201,14 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
 def save_ts_pct_csv(series: pd.Series, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    idx = pd.DatetimeIndex(series.index)
-    if idx.tz is None:
-        idx = idx.tz_localize(JST)
-    else:
-        idx = idx.tz_convert(JST)
+    idx = pd.DatetimeIndex(series.index).tz_convert(JST)
+    # DatetimeIndex には isoformat() が無いので各 Timestamp に map する
+    ts_list = [ts.isoformat() for ts in idx.to_pydatetime()]
     out = pd.DataFrame({
-        "ts": idx.isoformat(),
-        "pct": series.round(4)
+        "ts": ts_list,
+        "pct": pd.to_numeric(series, errors="coerce").round(4)
     })
+    out = out.dropna(subset=["pct"])
     out.to_csv(path, index=False)
 
 
@@ -243,7 +235,8 @@ def plot_debug(series: pd.Series, path: str) -> None:
 
 
 def save_post(series: pd.Series, path: str) -> None:
-    last = float(series.dropna().iloc[-1]) if not series.dropna().empty else 0.0
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    last = float(s.iloc[-1]) if not s.empty else 0.0
     sign = "+" if last >= 0 else ""
     text = (
         f"▲ R-BANK9 日中スナップショット（{jst_now().strftime('%Y/%m/%d %H:%M JST')}）\n"
@@ -270,8 +263,9 @@ def main():
 
     print("[INFO] done.")
     print(f"[INFO] wrote: {CSV_PATH}, {IMG_PATH}, {POST_PATH}")
+    tail_n = min(5, len(series))
     print("[INFO] tail:")
-    print(pd.DataFrame({"ts": series.index[-5:], "pct": series[-5:]}))
+    print(pd.DataFrame({"ts": pd.DatetimeIndex(series.index)[-tail_n:], "pct": series[-tail_n:]}))
 
 
 if __name__ == "__main__":
