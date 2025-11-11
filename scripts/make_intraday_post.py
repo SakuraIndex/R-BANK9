@@ -2,215 +2,196 @@
 # -*- coding: utf-8 -*-
 
 """
-R-BANK9 intraday snapshot/post generator 〔完全版〕
-入力 : docs/outputs/rbank9_intraday.csv
-       ヘッダは ts,pct
-       ts は "YYYY-MM-DDTHH:MM(+09:00)" または "YYYY-MM-DDTHH:MM:SS(+09:00)"
-出力 :
+R-BANK9 intraday snapshot/post generator (完全版)
+
+入力 CSV:
+  docs/outputs/rbank9_intraday.csv
+    - ヘッダ: ts,pct
+    - 例: 2025-11-11T09:05:00+09:00,0.12
+
+出力:
   - docs/outputs/rbank9_intraday.png
   - docs/outputs/rbank9_post_intraday.txt
-  - docs/outputs/rbank9_stats.json
+  - docs/outputs/rbank9_stats.json  （updated_at, pct_intraday を含む）
+
+特徴:
+  - ワークフローから古い引数（--index-key, --label, --dt-col, --value-type,
+    --basis, --session-start, --session-end, --day-anchor）が渡されても受け取りつつ無視。
+    必要な4引数（--csv --out-json --out-text --snapshot-png）のみ使用。
+  - CSV が欠落・不正・空の場合は非ゼロ終了（以降の公開ステップを止める）。
+  - ダークテーマの画像を出力。
 """
 
 from __future__ import annotations
+
 from pathlib import Path
 import argparse
 import json
-import re
 from typing import Tuple
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ===== デフォルト入出力（引数で上書き可） =====
-IN_CSV   = Path("docs/outputs/rbank9_intraday.csv")
-OUT_PNG  = Path("docs/outputs/rbank9_intraday.png")
-OUT_TXT  = Path("docs/outputs/rbank9_post_intraday.txt")
-OUT_STAT = Path("docs/outputs/rbank9_stats.json")
 
-TITLE = "R-BANK9 Intraday Snapshot (JST)"
+# デフォルト・パス（引数で上書きされる）
+IN_CSV_DEF   = Path("docs/outputs/rbank9_intraday.csv")
+OUT_PNG_DEF  = Path("docs/outputs/rbank9_intraday.png")
+OUT_TXT_DEF  = Path("docs/outputs/rbank9_post_intraday.txt")
+OUT_STAT_DEF = Path("docs/outputs/rbank9_stats.json")
 
-# ===== Util =====
-def _ensure_seconds(ts: str) -> str:
-    """'YYYY-MM-DDTHH:MM+09:00' のように秒が無い場合に ':00' を補う。"""
-    if not isinstance(ts, str):
-        return ts
-    # 末尾が +09:00 / -09:00 / Z などの前に :SS が無ければ追加
-    m = re.match(r"^(.+T\d{2}:\d{2})(?!(?::\d{2}))(\+|\-|Z)", ts)
-    if m:
-        return ts.replace(m.group(1), m.group(1) + ":00")
-    return ts
+INDEX_KEY_DEF = "R_BANK9"
+LABEL_DEF     = "R-BANK9"
+TITLE         = "R-BANK9 Intraday Snapshot (JST)"
 
-def _read_csv(csv_path: Path) -> pd.DataFrame:
+
+# -------- argparse（互換引数も受け取るが内部では無視） --------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    # 実際に使用する4引数
+    p.add_argument("--csv",          default=str(IN_CSV_DEF))
+    p.add_argument("--out-json",     default=str(OUT_STAT_DEF))
+    p.add_argument("--out-text",     default=str(OUT_TXT_DEF))
+    p.add_argument("--snapshot-png", default=str(OUT_PNG_DEF))
+
+    # 互換用（渡されても無視）
+    p.add_argument("--index-key", default=None)
+    p.add_argument("--label", default=None)
+    p.add_argument("--dt-col", default=None)
+    p.add_argument("--value-type", default=None)
+    p.add_argument("--basis", default=None)
+    p.add_argument("--session-start", default=None)
+    p.add_argument("--session-end", default=None)
+    p.add_argument("--day-anchor", default=None)
+
+    return p.parse_args()
+
+
+# -------- 表示まわり（ダークテーマ） --------
+def setup_dark_theme():
+    plt.rcParams.update({
+        "figure.facecolor": "#0b1420",
+        "axes.facecolor":   "#0b1420",
+        "savefig.facecolor":"#0b1420",
+        "text.color":       "#d4e9f7",
+        "axes.labelcolor":  "#d4e9f7",
+        "axes.edgecolor":   "#6b7f91",
+        "xtick.color":      "#c8d7e2",
+        "ytick.color":      "#c8d7e2",
+        "grid.color":       "#274057",
+        "axes.grid":        True,
+        "grid.alpha":       0.6,
+    })
+
+
+# -------- CSV 読み込み --------
+def read_csv_strict(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         raise ValueError(f"CSV がありません: {csv_path}")
 
-    raw = csv_path.read_text(encoding="utf-8").replace("\ufeff", "")
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    if not lines:
+    txt = csv_path.read_text(encoding="utf-8").replace("\ufeff", "")
+    # 前後・空行・全角スペースなどを整形
+    cleaned = "\n".join(
+        line.strip()
+        for line in txt.splitlines()
+        if line.strip()
+    )
+    if not cleaned:
         raise ValueError("CSV が空です。")
 
-    # 余計なインラインコメントや全角カンマ等を排除して再保存（頑健化）
-    cleaned = []
-    for ln in lines:
-        # CSV で無い行（例: 説明やヘッダの装飾など）を弾く
-        if "," not in ln:
-            continue
-        cleaned.append(ln)
-    csv_path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
-
+    csv_path.write_text(cleaned, encoding="utf-8")
     df = pd.read_csv(csv_path)
 
-    # 列名ゆらぎ吸収（Datetime/TS/ts, pct/percent など）
-    colmap = {c.lower().strip(): c for c in df.columns}
-    ts_col = next((colmap[k] for k in ("ts", "datetime", "time")), None)
-    pct_col = next((colmap[k] for k in ("pct", "percent", "change_pct")), None)
-    if not ts_col or not pct_col:
-        raise ValueError(f"必要列が見つかりません（ts と pct）。got={list(df.columns)}")
+    # ts/pct 必須
+    cols = {c.lower().strip(): c for c in df.columns}
+    if "ts" not in cols or "pct" not in cols:
+        raise ValueError(f"CSV ヘッダ不正（ts,pct 必須）: columns={list(df.columns)}")
 
-    df = df.rename(columns={ts_col: "ts", pct_col: "pct"})
-
-    # 秒なし→追加
-    df["ts"] = df["ts"].astype(str).map(_ensure_seconds)
-
-    # 例: 2025-11-11T10:00:00+09:00 / 2025-11-11T10:00:00Z 両対応
-    # 明示フォーマットで高速・確実に
-    parsed = pd.to_datetime(
-        df["ts"],
-        format="%Y-%m-%dT%H:%M:%S%z",
-        errors="coerce",
-    )
-    # もし format 不一致が多ければフォールバック（dateutil）
-    if parsed.isna().all():
-        parsed = pd.to_datetime(df["ts"], errors="coerce", utc=True)
-
-    df["ts"] = parsed.dt.tz_convert("Asia/Tokyo")
-    # pct は数値へ
+    df = df.rename(columns={cols["ts"]: "ts", cols["pct"]: "pct"})
+    # ts -> DateTime（JST）
+    df["ts"]  = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_convert("Asia/Tokyo")
     df["pct"] = pd.to_numeric(df["pct"], errors="coerce")
-
     df = df.dropna(subset=["ts", "pct"]).sort_values("ts")
-    # 同一時刻の重複は最後を採用
-    df = df.drop_duplicates(subset=["ts"], keep="last")
-    return df
-
-def _setup_dark(ax):
-    # ダークテーマ
-    fig = ax.figure
-    fig.patch.set_facecolor("#0b1420")
-    ax.set_facecolor("#0b1420")
-    for spine in ax.spines.values():
-        spine.set_color("#89a2b8")
-    ax.tick_params(colors="#d4e9f7")
-    ax.xaxis.label.set_color("#cfe6f3")
-    ax.yaxis.label.set_color("#cfe6f3")
-    ax.title.set_color("#e7f3ff")
-    ax.grid(True, alpha=0.25, color="#2a4158")
-
-def _plot(df: pd.DataFrame, out_png: Path) -> None:
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
-    _setup_dark(ax)
 
     if df.empty:
-        ax.set_title(TITLE)
-        ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                transform=ax.transAxes, color="#cfe6f3", fontsize=16)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Change vs Prev Close (%)")
-    else:
-        ax.plot(df["ts"], df["pct"], linewidth=2.0)
-        ax.set_title(TITLE)
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Change vs Prev Close (%)")
+        raise ValueError("CSV に有効データがありません。")
+
+    return df
+
+
+# -------- プロット --------
+def plot_series(df: pd.DataFrame, out_png: Path):
+    setup_dark_theme()
+
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
+    ax.plot(df["ts"], df["pct"])
+    ax.set_title(TITLE)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Change vs Prev Close (%)")
+
+    # 余白・スパイン調整
+    for spine in ax.spines.values():
+        spine.set_color("#36506b")
 
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
 
-def _write_post_and_stats(latest_pct: float, out_txt: Path, out_stat: Path) -> None:
-    now = pd.Timestamp.now(tz="Asia/Tokyo")
+
+# -------- 出力テキスト/JSON --------
+def build_post_text(latest_pct: float, label: str) -> str:
     sign = "+" if latest_pct >= 0 else ""
-    post = (
-        f"▲ R-BANK9 日中スナップショット（{now.strftime('%Y/%m/%d %H:%M')} JST）\n"
+    now_jst = pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y/%m/%d %H:%M JST")
+    return (
+        f"▲ {label} 日中スナップショット（{now_jst}）\n"
         f"{sign}{latest_pct:.2f}%（基準: prev_close）\n"
         f"#R_BANK9 #日本株\n"
     )
-    out_txt.write_text(post, encoding="utf-8")
 
-    stat = {
-        "index_key": "R_BANK9",
-        "label": "R-BANK9",
-        "pct_intraday": float(round(latest_pct, 6)),
+
+def build_stats_json(latest_pct: float, index_key: str, label: str) -> str:
+    obj = {
+        "index_key": index_key,
+        "label": label,
+        "pct_intraday": latest_pct,
         "basis": "prev_close",
         "session": {"start": "09:00", "end": "15:30", "anchor": "09:00"},
-        "updated_at": now.isoformat(),
+        "updated_at": pd.Timestamp.now(tz="Asia/Tokyo").isoformat(),
     }
-    out_stat.write_text(json.dumps(stat, ensure_ascii=False, indent=2), encoding="utf-8")
+    return json.dumps(obj, ensure_ascii=False, indent=2)
 
-def _write_fallback(out_png: Path, out_txt: Path, out_stat: Path, reason: str) -> None:
-    # 失敗時の見た目（ダークで no data）
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=160)
-    _setup_dark(ax)
-    ax.set_title(TITLE)
-    ax.text(0.5, 0.5, "no data", ha="center", va="center",
-            transform=ax.transAxes, color="#cfe6f3", fontsize=16)
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Change vs Prev Close (%)")
-    fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, bbox_inches="tight")
-    plt.close(fig)
 
-    now = pd.Timestamp.now(tz="Asia/Tokyo")
-    out_txt.write_text(
-        "▲ R-BANK9 日中スナップショット（no data）\n"
-        "+0.00%（基準: prev_close）\n"
-        "#R_BANK9 #日本株\n", encoding="utf-8"
-    )
-    out_stat.write_text(json.dumps({
-        "index_key": "R_BANK9",
-        "label": "R-BANK9",
-        "pct_intraday": 0.0,
-        "basis": "prev_close",
-        "updated_at": now.isoformat(),
-        "note": f"fallback: {reason}",
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--csv", default=str(IN_CSV))
-    p.add_argument("--out-json", default=str(OUT_STAT))
-    p.add_argument("--out-text", default=str(OUT_TXT))
-    p.add_argument("--snapshot-png", default=str(OUT_PNG))
-    return p.parse_args()
-
-def main() -> None:
+# -------- main --------
+def main():
     args = parse_args()
-    csv_path = Path(args.csv)
-    out_png  = Path(args.snapshot_png)
-    out_txt  = Path(args.out_text)
-    out_stat = Path(args.out_json)
 
-    try:
-        df = _read_csv(csv_path)
-    except Exception as e:
-        # ここで「no data 画像」を作るが、公開までは止めたいので exit 1
-        _write_fallback(out_png, out_txt, out_stat, reason=str(e))
-        print(f"[error] CSV read failed: {e}")
-        raise SystemExit(1)
+    in_csv   = Path(args.csv)              if args.csv          else IN_CSV_DEF
+    out_png  = Path(args.snapshot-png)     if args.snapshot_png else OUT_PNG_DEF
+    out_txt  = Path(args.out_text)         if args.out_text     else OUT_TXT_DEF
+    out_stat = Path(args.out_json)         if args.out_json     else OUT_STAT_DEF
 
-    # データは読めたが空 → no data 扱い（exit 1 で公開停止）
-    if df.empty:
-        _write_fallback(out_png, out_txt, out_stat, reason="empty dataframe after parse")
-        print("[error] dataframe is empty after parsing")
-        raise SystemExit(1)
+    # ラベル/キー（互換引数が来ていればそれを優先。無ければデフォルト）
+    index_key = (args.index_key or INDEX_KEY_DEF)
+    label     = (args.label or LABEL_DEF)
+
+    # CSV 読み込み（不正なら例外で失敗し、ワークフローを停止）
+    df = read_csv_strict(in_csv)
 
     latest_pct = float(df["pct"].iloc[-1])
 
     # 画像
-    _plot(df, out_png)
-    # 投稿文 & stats
-    _write_post_and_stats(latest_pct, out_txt, out_stat)
+    plot_series(df, out_png)
+
+    # テキスト
+    out_txt.parent.mkdir(parents=True, exist_ok=True)
+    out_txt.write_text(build_post_text(latest_pct, label), encoding="utf-8")
+
+    # JSON
+    out_stat.parent.mkdir(parents=True, exist_ok=True)
+    out_stat.write_text(build_stats_json(latest_pct, index_key, label), encoding="utf-8")
+
+    print(f"[ok] rows={len(df)} latest={latest_pct:.4f} -> {out_png}, {out_txt}, {out_stat}")
+
 
 if __name__ == "__main__":
     main()
