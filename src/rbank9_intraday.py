@@ -136,6 +136,23 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
     return s
 
 
+def pick_probe_series(tickers: List[str]) -> pd.Series:
+    """
+    複数ティッカーを試し、最初に成功した intraday Series を返す。
+    404/No data など一時障害があっても全滅でなければ継続。
+    """
+    last_err = None
+    for t in tickers:
+        try:
+            s = fetch_intraday_series(t)
+            if not s.empty:
+                return s
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] probe failed for {t}  # {e}")
+    raise RuntimeError(f"probe failed for all tickers; last error: {last_err}")
+
+
 def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
@@ -144,8 +161,8 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     indiv_pct: Dict[str, pd.Series] = {}
 
-    # まず 1 銘柄で「直近の取引日」を決める
-    probe = fetch_intraday_series(tickers[0])
+    # まずプローブで「直近の取引日」を決める（複数試行で堅牢化）
+    probe = pick_probe_series(tickers)
     day = last_trading_day(probe.index)  # JST の直近取引日
 
     # その日のセッション時間帯だけを使う
@@ -157,9 +174,9 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             x = s[(s.index.date == d2)]
         return x
 
-    # まず共通のグリッド（5m）を作る
-    grid_start = pd.Timestamp.combine(day, SESSION_START, tzinfo=JST)
-    grid_end   = pd.Timestamp.combine(day, SESSION_END,   tzinfo=JST)
+    # 共通のグリッド（5m）を作る（tzinfo= は使わず tz_localize で付与）
+    grid_start = pd.Timestamp(datetime.combine(day, SESSION_START)).tz_localize(JST)
+    grid_end   = pd.Timestamp(datetime.combine(day, SESSION_END)).tz_localize(JST)
     grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST)
 
     for t in tickers:
@@ -191,8 +208,13 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
 def save_ts_pct_csv(series: pd.Series, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    idx = pd.DatetimeIndex(series.index)
+    if idx.tz is None:
+        idx = idx.tz_localize(JST)
+    else:
+        idx = idx.tz_convert(JST)
     out = pd.DataFrame({
-        "ts": series.index.tz_convert(JST).isoformat(),
+        "ts": idx.isoformat(),
         "pct": series.round(4)
     })
     out.to_csv(path, index=False)
