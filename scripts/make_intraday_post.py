@@ -70,7 +70,7 @@ def parse_args() -> Args:
     )
 
 
-# ---------- Datetime parsing (JST-naive を JST とみなす) ----------
+# ---------- Datetime parsing ----------
 
 def _parse_to_jst(series: pd.Series) -> Optional[pd.DatetimeIndex]:
     ts = pd.to_datetime(series, errors="coerce", utc=False)
@@ -91,7 +91,6 @@ def _try_parse_dt_col(df: pd.DataFrame, col: str) -> Optional[pd.DatetimeIndex]:
 
 def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, Optional[str]]:
     if df.shape[1] == 0:
-        # 列すら無い（完全に空）とき
         return pd.DatetimeIndex([], tz=JST), None
     first = df.columns[0]
     ts = _parse_to_jst(df[first])
@@ -101,13 +100,11 @@ def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, Optio
         ts = _parse_to_jst(df[c])
         if ts is not None and ts.notna().any():
             return ts, c
-    # 行はあるが日時列が見つからないとき
     return pd.DatetimeIndex([], tz=JST), None
 
 
 def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # 行が 0 の場合もエラーにせず空 DataFrame を返す
     if df.shape[0] == 0:
         print("[warn] CSV has no rows. Proceeding with empty dataframe.")
         return pd.DataFrame(index=pd.DatetimeIndex([], tz=JST))
@@ -124,11 +121,9 @@ def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
     if used_col in df.columns:
         df = df.drop(columns=[used_col])
 
-    # 数値化
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 並び替え・重複除去
     if df.index.tz is None:
         df.index = df.index.tz_localize(JST)
     df = df.sort_index()
@@ -140,7 +135,7 @@ def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
     return df
 
 
-# ---------- Session slicing & aggregation ----------
+# ---------- Session & aggregation ----------
 
 def _slice_window(df_jst: pd.DataFrame, day_ts: pd.Timestamp, start_hm: str, end_hm: str) -> pd.DataFrame:
     start = pd.Timestamp(f"{day_ts.date()} {start_hm}", tz=JST)
@@ -260,7 +255,8 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
     ax.tick_params(colors="#AAB8C2")
 
     fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight", facecolor=fig.getFacecolor(), edgecolor="none")
+    # ← 修正：get_facecolor()
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
 
 
@@ -271,22 +267,17 @@ def main() -> int:
     print("=== Generate R-BANK9 intraday snapshot ===")
     print(f"CSV_UNIT = {args.csv_unit}")
 
-    # 1) CSV 読み込み（JST index）
     df = _read_csv_jst(args.csv, args.dt_col if args.dt_col else None)
 
-    # 2) セッション抽出（フォールバック付き）
     df_sess = _session_slice_with_fallbacks(df, args.session_start, args.session_end)
     if df_sess.empty:
         print("[warn] セッションに該当するデータがありません。フォールバックも空でした。")
 
-    # 3) ％系列に変換
     series_pct = _to_percent_series(df_sess, args.csv_unit)
 
-    # 4) 終値（％）
     pct_last_percent = float(np.round(series_pct.dropna().iloc[-1], 4)) if not series_pct.empty and series_pct.notna().any() else 0.0
     now_ts_jst = pd.Timestamp.now(tz=JST)
 
-    # 5) 出力
     _plot_series(Path(args.snapshot_png), args.label, series_pct)
     print(f"[make_intraday_post] snapshot saved -> {args.snapshot_png}")
 
