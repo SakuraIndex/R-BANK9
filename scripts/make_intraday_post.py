@@ -70,113 +70,7 @@ def parse_args() -> Args:
     )
 
 
-# -------------------- CSV 読み込み（JSTロバスト） --------------------
-
-def _parse_to_jst(s: pd.Series) -> Optional[pd.DatetimeIndex]:
-    """tz付→JSTへconvert、tzなし→JSTとしてlocalize。失敗はNone"""
-    ts = pd.to_datetime(s, errors="coerce", utc=False)
-    if ts.isna().all():
-        return None
-    # tz判定
-    try:
-        if getattr(ts.dt, "tz", None) is not None:
-            return ts.dt.tz_convert(JST)
-        else:
-            return ts.dt.tz_localize(JST)
-    except Exception:
-        return None
-
-
-def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, str]:
-    # 1) 先頭列→2) 全列スキャン
-    cand = [df.columns[0], *list(df.columns[1:])]
-    for c in cand:
-        idx = _parse_to_jst(df[c])
-        if idx is not None and idx.notna().any():
-            return idx, c
-    raise TypeError("Datetime index が取得できません。CSVの日時列をご確認ください。")
-
-
-def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        raise ValueError("CSV が空です。")
-
-    used_col: Optional[str] = None
-    if prefer_col and prefer_col in df.columns:
-        idx = _parse_to_jst(df[prefer_col])
-        if idx is not None and idx.notna().any():
-            used_col = prefer_col
-        else:
-            idx, used_col = _auto_find_datetime_index(df)
-    else:
-        idx, used_col = _auto_find_datetime_index(df)
-
-    df.index = idx
-    if used_col in df.columns:
-        df = df.drop(columns=[used_col])
-
-    # 数値化
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # 並び替え・重複除去
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-
-    print(f"[read_csv] rows={len(df)} used_dt_col={used_col} tz={df.index.tz}")
-    print(f"[read_csv] numeric_cols={[(c, df[c].notna().sum()) for c in df.columns]}")
-    return df
-
-
-# -------------------- セッション抽出 & 単位変換 --------------------
-
-def _session_slice(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
-    if df_jst.empty:
-        return df_jst
-    last_day = df_jst.index[-1].date()
-    start = pd.Timestamp(f"{last_day} {start_hm}", tz=JST)
-    # 引け後の遅延書込みのため +5分だけ許容
-    end = pd.Timestamp(f"{last_day} {end_hm}", tz=JST) + pd.Timedelta(minutes=5)
-    out = df_jst.loc[(df_jst.index >= start) & (df_jst.index <= end)]
-    print(f"[session] window={start}..{end} -> rows={len(out)}")
-    return out
-
-
-def _detect_unit_is_ratio(df: pd.DataFrame) -> bool:
-    vals = pd.to_numeric(df.to_numpy().ravel(), errors="coerce")
-    vals = vals[~np.isnan(vals)]
-    if vals.size == 0:
-        return False
-    return float(np.nanquantile(np.abs(vals), 0.95)) < 0.5
-
-
-def _to_percent_series(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
-    if df_session.empty:
-        return pd.Series(dtype=float)
-
-    cols: List[str] = [c for c in df_session.columns if pd.api.types.is_numeric_dtype(df_session[c])]
-    dfn = df_session[cols].copy()
-
-    # 1) 既成の集計列を優先（R_BANK9 / R-BANK9）
-    keylike = [c for c in cols if c.strip().upper() in ("R_BANK9", "R-BANK9")]
-    if keylike:
-        s = pd.to_numeric(dfn[keylike[0]], errors="coerce")
-    else:
-        # 2) 等加重平均（単位揃え）
-        unit = csv_unit
-        if unit == "auto":
-            unit = "ratio" if _detect_unit_is_ratio(dfn) else "percent"
-        if unit == "ratio":
-            dfn = dfn * 100.0
-        s = dfn.mean(axis=1, skipna=True)
-
-    # クリップ&欠損除去
-    s = s.clip(lower=-25.0, upper=25.0)
-    return s
-
-
-# -------------------- 出力 --------------------
+# -------------------- 低レベル出力（no data 含む） --------------------
 
 def _format_sign_pct(x: float) -> str:
     return f"{x:+.2f}%"
@@ -193,7 +87,7 @@ def _save_text(path: Path, label: str, pct_last: float, basis: str, now_ts_jst: 
 
 def _save_json(path: Path, index_key: str, label: str, pct_last_percent: float,
                basis: str, start_hm: str, end_hm: str, anchor_hm: str,
-               now_ts_jst: pd.Timestamp) -> None:
+               now_ts_jst: pd.Timestamp, unit: str = "ratio") -> None:
     import json
     pct_ratio = float(np.round(pct_last_percent / 100.0, 6))
     payload = {
@@ -203,18 +97,18 @@ def _save_json(path: Path, index_key: str, label: str, pct_last_percent: float,
         "basis": basis,
         "session": {"start": start_hm, "end": end_hm, "anchor": anchor_hm},
         "updated_at": now_ts_jst.isoformat(),
-        "unit": "ratio",
+        "unit": unit,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
+def _plot_series(path: Path, label: str, series_pct: Optional[pd.Series]) -> None:
     plt.style.use("dark_background")
     fig, ax = plt.subplots(figsize=(12, 6), dpi=150)
     fig.patch.set_facecolor("#000000")
     ax.set_facecolor("#000000")
 
-    if not series_pct.empty and series_pct.notna().any():
+    if series_pct is not None and not series_pct.empty and series_pct.notna().any():
         s = series_pct.dropna()
         last_val = float(s.iloc[-1])
         line_color = "#00E5FF" if last_val >= 0 else "#FF4D4D"
@@ -239,6 +133,131 @@ def _plot_series(path: Path, label: str, series_pct: pd.Series) -> None:
     plt.close(fig)
 
 
+def _emit_nodata(args: Args, note: str) -> None:
+    now_ts_jst = pd.Timestamp.now(tz=JST)
+    print(f"[WARN] no-data fallback: {note}")
+    _plot_series(Path(args.snapshot_png), args.label, None)
+    _save_text(Path(args.out_text), args.label, 0.0, args.basis, now_ts_jst)
+    _save_json(Path(args.out_json), args.index_key, args.label, 0.0,
+               args.basis, args.session_start, args.session_end, args.day_anchor, now_ts_jst, unit="ratio")
+    print(f"[done] fallback outputs written: png/text/json")
+
+
+# -------------------- CSV 読み込み（JSTロバスト） --------------------
+
+def _parse_to_jst(s: pd.Series) -> Optional[pd.DatetimeIndex]:
+    ts = pd.to_datetime(s, errors="coerce", utc=False)
+    if ts.isna().all():
+        return None
+    try:
+        if getattr(ts.dt, "tz", None) is not None:
+            return ts.dt.tz_convert(JST)
+        else:
+            return ts.dt.tz_localize(JST)
+    except Exception:
+        return None
+
+
+def _auto_find_datetime_index(df: pd.DataFrame) -> Tuple[pd.DatetimeIndex, str]:
+    for c in [df.columns[0], *list(df.columns[1:])]:
+        idx = _parse_to_jst(df[c])
+        if idx is not None and idx.notna().any():
+            return idx, c
+    raise TypeError("Datetime index が取得できません。")
+
+
+def _read_csv_jst(csv_path: Path, prefer_col: Optional[str]) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_csv(
+            csv_path,
+            encoding="utf-8",
+            engine="python",
+            comment="#",
+            skip_blank_lines=True,
+        )
+    except Exception as e:
+        print(f"[read_csv] error reading CSV: {e}")
+        return None
+
+    if df is None or df.empty:
+        print("[read_csv] empty dataframe")
+        return None
+
+    used_col: Optional[str] = None
+    try:
+        if prefer_col and prefer_col in df.columns:
+            idx = _parse_to_jst(df[prefer_col])
+            if idx is not None and idx.notna().any():
+                used_col = prefer_col
+            else:
+                idx, used_col = _auto_find_datetime_index(df)
+        else:
+            idx, used_col = _auto_find_datetime_index(df)
+    except Exception as e:
+        print(f"[read_csv] failed to detect datetime index: {e}")
+        return None
+
+    df.index = idx
+    if used_col in df.columns:
+        df = df.drop(columns=[used_col])
+
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    print(f"[read_csv] rows={len(df)} used_dt_col={used_col} tz={df.index.tz}")
+    print(f"[read_csv] numeric_cols={[(c, int(df[c].notna().sum())) for c in df.columns]}")
+    return df
+
+
+# -------------------- セッション抽出 & 単位変換 --------------------
+
+def _session_slice(df_jst: pd.DataFrame, start_hm: str, end_hm: str) -> pd.DataFrame:
+    if df_jst.empty:
+        return df_jst
+    last_day = df_jst.index[-1].date()
+    start = pd.Timestamp(f"{last_day} {start_hm}", tz=JST)
+    end = pd.Timestamp(f"{last_day} {end_hm}", tz=JST) + pd.Timedelta(minutes=5)
+    out = df_jst.loc[(df_jst.index >= start) & (df_jst.index <= end)]
+    print(f"[session] window={start}..{end} -> rows={len(out)}")
+    return out
+
+
+def _detect_unit_is_ratio(df: pd.DataFrame) -> bool:
+    vals = pd.to_numeric(df.to_numpy().ravel(), errors="coerce")
+    vals = vals[~np.isnan(vals)]
+    if vals.size == 0:
+        return False
+    return float(np.nanquantile(np.abs(vals), 0.95)) < 0.5
+
+
+def _to_percent_series(df_session: pd.DataFrame, csv_unit: str) -> pd.Series:
+    if df_session.empty:
+        return pd.Series(dtype=float)
+
+    cols: List[str] = [c for c in df_session.columns if pd.api.types.is_numeric_dtype(df_session[c])]
+    if not cols:
+        return pd.Series(dtype=float)
+
+    dfn = df_session[cols].copy()
+
+    keylike = [c for c in cols if c.strip().upper() in ("R_BANK9", "R-BANK9")]
+    if keylike:
+        s = pd.to_numeric(dfn[keylike[0]], errors="coerce")
+    else:
+        unit = csv_unit
+        if unit == "auto":
+            unit = "ratio" if _detect_unit_is_ratio(dfn) else "percent"
+        if unit == "ratio":
+            dfn = dfn * 100.0
+        s = dfn.mean(axis=1, skipna=True)
+
+    s = s.clip(lower=-25.0, upper=25.0)
+    return s
+
+
 # -------------------- main --------------------
 
 def main() -> int:
@@ -246,27 +265,31 @@ def main() -> int:
     print("=== Generate R-BANK9 intraday snapshot ===")
     print(f"CSV_UNIT = {args.csv_unit}")
 
-    # 1) CSV 読み込み（JST index）
+    # 1) CSV 読み込み
     df = _read_csv_jst(args.csv, args.dt_col if args.dt_col else None)
+    if df is None or df.empty:
+        _emit_nodata(args, "CSV empty or unreadable")
+        return 0
 
     # 2) セッション抽出
     df_sess = _session_slice(df, args.session_start, args.session_end)
     if df_sess.empty:
-        raise ValueError("セッション時間帯に該当するデータがありません。（日時のタイムゾーン/列名をご確認ください）")
+        _emit_nodata(args, "no rows in session window")
+        return 0
 
     # 3) ％系列に変換
     series_pct = _to_percent_series(df_sess, args.csv_unit)
-    print(f"[series] len={len(series_pct)} valid={series_pct.notna().sum()}")
+    print(f"[series] len={len(series_pct)} valid={int(series_pct.notna().sum())}")
 
-    if series_pct.notna().sum() == 0:
-        raise ValueError("有効なデータ点がありません（全て欠損）。入力CSVの列/単位をご確認ください。")
+    if series_pct.dropna().empty:
+        _emit_nodata(args, "all values NA after conversion")
+        return 0
 
-    # 4) 終値（最後の有効値）
+    # 4) 出力（最後の有効値）
     s_valid = series_pct.dropna()
     pct_last_percent = float(np.round(s_valid.iloc[-1], 4))
     now_ts_jst = pd.Timestamp.now(tz=JST)
 
-    # 5) 出力
     _plot_series(Path(args.snapshot_png), args.label, series_pct)
     print(f"[make_intraday_post] snapshot saved -> {args.snapshot_png}")
 
@@ -274,7 +297,7 @@ def main() -> int:
     print(f"[make_intraday_post] text saved -> {args.out_text}")
 
     _save_json(Path(args.out_json), args.index_key, args.label, pct_last_percent,
-               args.basis, args.session_start, args.session_end, args.day_anchor, now_ts_jst)
+               args.basis, args.session_start, args.session_end, args.day_anchor, now_ts_jst, unit="ratio")
     print(f"[make_intraday_post] json saved -> {args.out_json}")
 
     return 0
