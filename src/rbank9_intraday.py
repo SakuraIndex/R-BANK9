@@ -1,13 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 R-BANK9 intraday index snapshot (equal-weight, vs prev close, percent)
+
+- 9 銘柄を等ウェイトで合成
+- 前日終値比（%）を 5 分足で算出
+- 直近の取引日（JST）だけを抽出
+- 共通 5 分グリッドに reindex + ffill で整列
+- クリップで異常値を抑制
+- 出力:
+    docs/outputs/rbank9_intraday.csv (ts,pct)
+    docs/outputs/rbank9_intraday.png
+    docs/outputs/rbank9_post_intraday.txt
 """
 
 from __future__ import annotations
 
 import os
-from typing import List, Dict, Optional
-from datetime import datetime, time
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime, time, timedelta
 
 import pandas as pd
 import yfinance as yf
@@ -22,19 +32,37 @@ CSV_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.csv")
 IMG_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.png")
 POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
 
-INTRA_INTERVAL = "5m"
-INTRA_PERIOD   = "3d"
+# まず 5m を狙い、ダメなら 15m にフォールバック
+PRIMARY_INTERVALS  = ["5m", "15m"]
+PRIMARY_PERIODS    = ["3d", "7d"]
 
 PCT_CLIP_LOW  = -20.0
 PCT_CLIP_HIGH =  20.0
 
-SESSION_START = time(9, 0)    # 09:00
-SESSION_END   = time(15, 30)  # 15:30
+SESSION_START = time(9, 0)    # 09:00 JST
+SESSION_END   = time(15, 30)  # 15:30 JST
 
 
 # ---------- ユーティリティ ----------
 def jst_now() -> pd.Timestamp:
     return pd.Timestamp.now(tz=JST_TZ)
+
+
+def session_bounds(day: datetime.date) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp.combine(pd.Timestamp(day), SESSION_START).tz_localize(JST_TZ)
+    end   = pd.Timestamp.combine(pd.Timestamp(day), SESSION_END).tz_localize(JST_TZ)
+    # close を跨いだ場合の保険（今回は無い想定だが念のため）
+    if end <= start:
+        end += pd.Timedelta(days=1)
+    return start, end
+
+
+def make_grid(day: datetime.date, until: Optional[pd.Timestamp] = None, freq: str = "5m") -> pd.DatetimeIndex:
+    start, end = session_bounds(day)
+    if until is not None:
+        # 途中までのグリッド（現在時刻を 5 分に丸めて使う）
+        end = min(end, until.floor(freq))
+    return pd.date_range(start=start, end=end, freq=freq, tz=JST_TZ)
 
 
 def load_tickers(path: str) -> List[str]:
@@ -78,7 +106,7 @@ def last_trading_day(ts_index: pd.DatetimeIndex) -> datetime.date:
 
 
 def fetch_prev_close(ticker: str, day: datetime.date) -> float:
-    d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
+    d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False, prepost=False)
     if d.empty:
         raise RuntimeError(f"prev close empty for {ticker}")
     s = _to_series_1d_close(d)
@@ -87,16 +115,21 @@ def fetch_prev_close(ticker: str, day: datetime.date) -> float:
         s.index = s.index.tz_localize("UTC")
     s = s.tz_convert(JST_TZ)
     s_before = s[s.index.date < day]
-    if s_before.empty:
-        return float(s.iloc[-1])
-    return float(s_before.iloc[-1])
+    return float((s_before.iloc[-1] if not s_before.empty else s.iloc[-1]))
 
 
-def fetch_intraday_series(ticker: str) -> pd.Series:
-    d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
-                    auto_adjust=False, progress=False)
+def _try_download(ticker: str, period: str, interval: str) -> pd.Series:
+    d = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        prepost=False,
+        threads=True,
+    )
     if d.empty:
-        raise RuntimeError(f"intraday empty for {ticker}")
+        return pd.Series(dtype=float)
     s = _to_series_1d_close(d)
     idx = pd.to_datetime(s.index)
     if idx.tz is None:
@@ -105,25 +138,48 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
     return pd.Series(s.values, index=idx)
 
 
-def _first_available_probe(tickers: List[str]) -> tuple[str, pd.Series]:
+def fetch_intraday_series_smart(ticker: str) -> Tuple[pd.Series, str, str]:
+    """
+    5m/3d → 5m/7d → 15m/3d → 15m/7d の順に試す。
+    戻り値: (Series[JST], period, interval)
+    """
+    last_err: Optional[Exception] = None
+    for interval in PRIMARY_INTERVALS:
+        for period in PRIMARY_PERIODS:
+            try:
+                s = _try_download(ticker, period, interval)
+                if not s.empty:
+                    return s, period, interval
+            except Exception as e:
+                last_err = e
+    if last_err:
+        print(f"[WARN] all intraday attempts failed for {ticker}: {last_err!r}")
+    return pd.Series(dtype=float), "", ""
+
+
+def _first_available_probe(tickers: List[str]) -> Tuple[str, pd.Series, str, str]:
     last_err: Optional[Exception] = None
     for t in tickers:
         try:
-            s = fetch_intraday_series(t)
+            s, p, iv = fetch_intraday_series_smart(t)
             if not s.empty:
-                return t, s
+                return t, s, p, iv
         except Exception as e:
             last_err = e
             print(f"[WARN] probe failed for {t}: {e}")
     raise RuntimeError(f"no available intraday series for probe (last_err={last_err})")
 
 
-def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
+def build_equal_weight_pct(tickers: List[str]) -> Tuple[pd.Series, str]:
+    """
+    等ウェイト [%] シリーズと、最終的に使ったグリッド頻度（'5m' or '15m'）を返す
+    """
     indiv_pct: Dict[str, pd.Series] = {}
 
-    probe_t, probe = _first_available_probe(tickers)
-    day = last_trading_day(probe.index)
-    print(f"[INFO] target trading day (JST): {day} (probe={probe_t})")
+    probe_t, probe_s, _, probe_iv = _first_available_probe(tickers)
+    day = last_trading_day(probe_s.index)
+    grid_freq = "5m" if probe_iv == "5m" else "15m"
+    print(f"[INFO] target trading day (JST): {day} (probe={probe_t}, interval={probe_iv})")
 
     def _slice_day(s: pd.Series) -> pd.Series:
         x = s[(s.index.date == day)]
@@ -132,13 +188,12 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             x = s[(s.index.date == d2)]
         return x
 
-    grid_start = pd.Timestamp.combine(pd.Timestamp(day), SESSION_START).tz_localize(JST_TZ)
-    grid_end   = pd.Timestamp.combine(pd.Timestamp(day), SESSION_END).tz_localize(JST_TZ)
-    grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST_TZ)
+    # グリッド頻度はプローブに合わせる
+    grid = make_grid(day, until=jst_now(), freq=grid_freq)
 
     for t in tickers:
         try:
-            s = probe if t == probe_t else fetch_intraday_series(t)
+            s = probe_s if t == probe_t else fetch_intraday_series_smart(t)[0]
             s = _slice_day(s)
             if s.empty:
                 print(f"[WARN] {t}: no intraday for target day, skip")
@@ -152,32 +207,37 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             print(f"[WARN] skip {t}  # {e}")
 
     if not indiv_pct:
-        print("[ERROR] 0 series collected. Check tickers or network.")
-        return pd.Series(dtype=float)
+        print("[ERROR] 0 series collected. Check tickers/network.")
+        return pd.Series(dtype=float), grid_freq
 
     df = pd.concat(indiv_pct.values(), axis=1)
     series = df.mean(axis=1, skipna=True).astype(float)
     series.name = "R_BANK9"
-    return series
+    return series, grid_freq
 
 
-def save_ts_pct_csv(series: pd.Series, path: str) -> None:
+# ---------- 出力 ----------
+def save_ts_pct_csv(series: pd.Series, path: str, grid_freq: str) -> None:
     """
-    重要：データが空でも「現在時刻 / pct=0.0」の1行を書き出して、
-    Git 上で確実に変更が検知されるようにする（PNG/TXTと足並みを揃える）。
+    空の場合でも、当日セッションの 5 分（または 15 分）グリッドを 0.0 で出力。
+    これで毎回 CSV が“時系列として”更新される。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     if series is None or len(series) == 0:
-        hb_ts = jst_now().strftime("%Y-%m-%dT%H:%M:%S%z")
-        out = pd.DataFrame({"ts": [hb_ts], "pct": [0.0]})
+        # 当日グリッドを作って 0 で埋める
+        today = jst_now().date()
+        grid = make_grid(today, until=jst_now(), freq=grid_freq)
+        out = pd.DataFrame({"ts": grid.strftime("%Y-%m-%dT%H:%M:%S%z"), "pct": 0.0})
         out.to_csv(path, index=False)
-        print("[INFO] CSV heartbeat row written (no data)")
+        print(f"[INFO] CSV written with zero-filled grid rows: {len(out)} (no data case)")
         return
 
     s = series.dropna()
-    ts_str = pd.Index(s.index.tz_convert(JST_TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
-    out = pd.DataFrame({"ts": ts_str, "pct": s.round(4).values})
+    out = pd.DataFrame({
+        "ts": s.index.tz_convert(JST_TZ).strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "pct": s.round(4).values
+    })
     out.to_csv(path, index=False)
     print(f"[INFO] wrote CSV rows: {len(out)}")
 
@@ -231,10 +291,11 @@ def main():
     try:
         tickers = load_tickers(TICKER_FILE)
         print(f"[INFO] tickers: {', '.join(tickers)}")
-        print("[INFO] building equal-weight percent series...")
-        series = build_equal_weight_pct(tickers)
 
-        save_ts_pct_csv(series, CSV_PATH)
+        print("[INFO] building equal-weight percent series...")
+        series, grid_freq = build_equal_weight_pct(tickers)
+
+        save_ts_pct_csv(series, CSV_PATH, grid_freq)
         plot_debug(series, IMG_PATH)
         save_post(series, POST_PATH)
 
@@ -244,7 +305,7 @@ def main():
             print("[INFO] tail:")
             print(tail)
         else:
-            print("[INFO] series empty (heartbeat row only)")
+            print("[INFO] series empty → zero-filled grid CSV written")
     except Exception as e:
         print(f"[FATAL] intraday build failed: {e!r}")
 
