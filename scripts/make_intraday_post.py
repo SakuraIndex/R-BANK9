@@ -26,6 +26,7 @@ from typing import Optional
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
+from pandas.api.types import is_datetime64tz_dtype
 
 TZ = "Asia/Tokyo"
 
@@ -60,7 +61,7 @@ def read_ts_pct(csv_path: Path) -> pd.DataFrame:
     intraday CSV をラフにクレンジングして ts, pct を返す。
     - コメント行(#...), 空行, カンマ数≠1 行を除外
     - ヘッダの有無は問わない（header=None で読み、型変換時に NaT/NaN を落とす）
-    - tz-naive/UTC どちらでも JST に統一
+    - tz-naive は JST ローカライズ / tz-aware は JST へ変換
     - 異常値(±30%超)は除外
     """
     if not csv_path.exists():
@@ -89,16 +90,17 @@ def read_ts_pct(csv_path: Path) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["ts", "pct"])
 
-    # 型変換 (ts → JST, pct → float)
-    ts = pd.to_datetime(df["ts"], errors="coerce", utc=True)
-    # ts が tz-naive 混入の場合にも対応（NaT を補正）
-    if ts.isna().any():
-        ts2 = pd.to_datetime(df["ts"], errors="coerce")
-        # naive を JST と見なす
-        ts2 = ts2.dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT")
-        ts = ts.fillna(ts2)
-    # JST へ
-    ts = ts.dt.tz_convert(TZ)
+    # --- ts のパース（tz-naive / tz-aware を判定して処理を分岐）---
+    # utc=True は使わない（+0900 付き文字列を強制 UTC 化してしまうため）
+    ts_parsed = pd.to_datetime(df["ts"], errors="coerce", utc=False)
+
+    if is_datetime64tz_dtype(ts_parsed):
+        # 既に tz-aware（例: "+0900" 付き文字列）→ JST へ変換
+        ts = ts_parsed.dt.tz_convert(TZ)
+    else:
+        # tz-naive → JST としてローカライズ
+        # （一部 NaT が混ざってもこの時点ではそのまま。後で dropna）
+        ts = ts_parsed.dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT")
 
     pct = pd.to_numeric(df["pct"], errors="coerce")
 
