@@ -16,16 +16,16 @@ from __future__ import annotations
 
 import os
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta, time
+from datetime import datetime, time
 
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
 # ---------- 設定 ----------
-JST_TZ = "Asia/Tokyo"          # pandas には文字列で渡すのが扱いやすい
+JST_TZ = "Asia/Tokyo"              # pandas はタイムゾーン名で扱うのが楽
 OUT_DIR = "docs/outputs"
-TICKER_FILE = "docs/tickers_rbank9.txt"   # 5830.T などを 1 行 1 ティッカー
+TICKER_FILE = "docs/tickers_rbank9.txt"   # 8331.T などを 1 行 1 ティッカー
 
 CSV_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.csv")     # ts,pct
 IMG_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.png")     # デバッグ用
@@ -58,7 +58,7 @@ def load_tickers(path: str) -> List[str]:
                 continue
             xs.append(s)
     if not xs:
-        raise RuntimeError("No tickers in docs/tickers_rbank9.txt")
+        raise RuntimeError("No tickers found in docs/tickers_rbank9.txt")
     return xs
 
 
@@ -132,6 +132,22 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
     return pd.Series(s.values, index=idx)
 
 
+def _first_available_probe(tickers: List[str]) -> tuple[str, pd.Series]:
+    """
+    取れる銘柄が見つかるまで順に試し、最初に取れた intraday を返す
+    """
+    last_err: Optional[Exception] = None
+    for t in tickers:
+        try:
+            s = fetch_intraday_series(t)
+            if not s.empty:
+                return t, s
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] probe failed for {t}: {e}")
+    raise RuntimeError(f"no available intraday series for probe (last_err={last_err})")
+
+
 def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
@@ -140,10 +156,10 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     indiv_pct: Dict[str, pd.Series] = {}
 
-    # まず 1 銘柄で「直近の取引日」を決める
-    probe = fetch_intraday_series(tickers[0])
+    # まず「取れる銘柄」をプローブに採用
+    probe_t, probe = _first_available_probe(tickers)
     day = last_trading_day(probe.index)  # JST の直近取引日
-    print(f"[INFO] target trading day (JST): {day} (probe={tickers[0]})")
+    print(f"[INFO] target trading day (JST): {day} (probe={probe_t})")
 
     # その日のセッション時間帯だけを使う
     def _slice_day(s: pd.Series) -> pd.Series:
@@ -153,21 +169,22 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             x = s[(s.index.date == d2)]
         return x
 
-    # 共通の 5m グリッドを作る（tz は tz_localize を使うのが正解）
-    grid_start = pd.Timestamp(datetime.combine(day, SESSION_START)).tz_localize(JST_TZ)
-    grid_end   = pd.Timestamp(datetime.combine(day, SESSION_END)).tz_localize(JST_TZ)
+    # 共通の 5m グリッド（tz は tz_localize を使う）
+    grid_start = pd.Timestamp.combine(pd.Timestamp(day), SESSION_START).tz_localize(JST_TZ)
+    grid_end   = pd.Timestamp.combine(pd.Timestamp(day), SESSION_END).tz_localize(JST_TZ)
     grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST_TZ)
 
+    # プローブも含めて全銘柄処理
     for t in tickers:
         try:
-            intraday = fetch_intraday_series(t)
-            intraday = _slice_day(intraday)
-            if intraday.empty:
+            s = probe if t == probe_t else fetch_intraday_series(t)
+            s = _slice_day(s)
+            if s.empty:
                 print(f"[WARN] {t}: no intraday for target day, skip")
                 continue
 
             prev = fetch_prev_close(t, day)
-            pct = (intraday / prev - 1.0) * 100.0
+            pct = (s / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
 
             pct = pct.reindex(grid).ffill()
@@ -176,7 +193,6 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             print(f"[WARN] skip {t}  # {e}")
 
     if not indiv_pct:
-        # ぜんぶ空なら空 Series を返す（呼び出し側で保存スキップ）
         print("[ERROR] 0 series collected. Check tickers or network.")
         return pd.Series(dtype=float)
 
@@ -187,15 +203,19 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
 
 def save_ts_pct_csv(series: pd.Series, path: str) -> None:
-    if series is None or len(series) == 0:
-        print("[INFO] empty series -> skip writing CSV (keep previous file if any)")
-        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    out = pd.DataFrame({
-        "ts": series.index.tz_convert(JST_TZ).astype("datetime64[ns, {}]".format(JST_TZ)).astype(str),
-        "pct": series.round(4)
-    })
+
+    if series is None or len(series) == 0:
+        # 空でもヘッダは出す（ワークフローの更新検知を安定化）
+        pd.DataFrame(columns=["ts", "pct"]).to_csv(path, index=False)
+        print("[INFO] wrote CSV header only (no data)")
+        return
+
+    s = series.dropna()
+    ts_str = pd.Index(s.index.tz_convert(JST_TZ)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    out = pd.DataFrame({"ts": ts_str, "pct": s.round(4).values})
     out.to_csv(path, index=False)
+    print(f"[INFO] wrote CSV rows: {len(out)}")
 
 
 def plot_debug(series: Optional[pd.Series], path: str) -> None:
@@ -261,9 +281,9 @@ def main():
             print("[INFO] tail:")
             print(tail)
         else:
-            print("[INFO] series empty (no data written to CSV)")
+            print("[INFO] series empty")
     except Exception as e:
-        # 例外でワークフローが落ちるとコミットが止まるため、ログだけ残して終了
+        # 例外でワークフローが落ちるとコミットが止まるため、ログだけ残して正常終了扱い
         print(f"[FATAL] intraday build failed: {e!r}")
 
 
