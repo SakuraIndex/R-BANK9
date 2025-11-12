@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 R-BANK9 intraday index snapshot (equal-weight, vs prev close, percent)
-
-- 9 銘柄を等ウェイトで合成
-- 前日終値比（%）を 5 分足で算出
-- 直近の取引日（JST）だけを抽出
-- 共通 5 分グリッドに reindex + ffill で整列
-- クリップで異常値を抑制
-- 出力: docs/outputs/rbank9_intraday.csv (ts,pct)
-      docs/outputs/rbank9_intraday.png（簡易デバッグ用）
-      docs/outputs/rbank9_post_intraday.txt（簡易ポスト文）
 """
 
 from __future__ import annotations
@@ -23,25 +14,22 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 
 # ---------- 設定 ----------
-JST_TZ = "Asia/Tokyo"              # pandas はタイムゾーン名で扱うのが楽
+JST_TZ = "Asia/Tokyo"
 OUT_DIR = "docs/outputs"
-TICKER_FILE = "docs/tickers_rbank9.txt"   # 8331.T などを 1 行 1 ティッカー
+TICKER_FILE = "docs/tickers_rbank9.txt"
 
-CSV_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.csv")     # ts,pct
-IMG_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.png")     # デバッグ用
+CSV_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.csv")
+IMG_PATH  = os.path.join(OUT_DIR, "rbank9_intraday.png")
 POST_PATH = os.path.join(OUT_DIR, "rbank9_post_intraday.txt")
 
-# 5 分足で安定運用
 INTRA_INTERVAL = "5m"
-INTRA_PERIOD   = "3d"   # 直近 3 営業日
+INTRA_PERIOD   = "3d"
 
-# 安全弁（%）
 PCT_CLIP_LOW  = -20.0
 PCT_CLIP_HIGH =  20.0
 
-# 市場の見た目の時間（JST）
-SESSION_START = time(9, 0)   # 09:00
-SESSION_END   = time(15, 30) # 15:30
+SESSION_START = time(9, 0)    # 09:00
+SESSION_END   = time(15, 30)  # 15:30
 
 
 # ---------- ユーティリティ ----------
@@ -63,9 +51,6 @@ def load_tickers(path: str) -> List[str]:
 
 
 def _to_series_1d_close(df: pd.DataFrame) -> pd.Series:
-    """
-    yfinance の Close 列（形状ゆらぎを 1D に正規化）
-    """
     if "Close" not in df.columns:
         raise ValueError("Close column not found")
     close = df["Close"]
@@ -85,9 +70,6 @@ def _to_series_1d_close(df: pd.DataFrame) -> pd.Series:
 
 
 def last_trading_day(ts_index: pd.DatetimeIndex) -> datetime.date:
-    """
-    与えられたインデックス（tz aware 可）から「最後の取引日（JST）」を返す
-    """
     idx = pd.to_datetime(ts_index)
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
@@ -96,19 +78,14 @@ def last_trading_day(ts_index: pd.DatetimeIndex) -> datetime.date:
 
 
 def fetch_prev_close(ticker: str, day: datetime.date) -> float:
-    """
-    指定した銘柄の「指定取引日の前日終値」を取得。
-    """
     d = yf.download(ticker, period="10d", interval="1d", auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"prev close empty for {ticker}")
-
     s = _to_series_1d_close(d)
     s.index = pd.to_datetime(s.index)
     if s.index.tz is None:
         s.index = s.index.tz_localize("UTC")
     s = s.tz_convert(JST_TZ)
-
     s_before = s[s.index.date < day]
     if s_before.empty:
         return float(s.iloc[-1])
@@ -116,14 +93,10 @@ def fetch_prev_close(ticker: str, day: datetime.date) -> float:
 
 
 def fetch_intraday_series(ticker: str) -> pd.Series:
-    """
-    指定銘柄の直近 INTRA_PERIOD x INTRA_INTERVAL を取得し、Close を返す（tz JST）
-    """
     d = yf.download(ticker, period=INTRA_PERIOD, interval=INTRA_INTERVAL,
                     auto_adjust=False, progress=False)
     if d.empty:
         raise RuntimeError(f"intraday empty for {ticker}")
-
     s = _to_series_1d_close(d)
     idx = pd.to_datetime(s.index)
     if idx.tz is None:
@@ -133,9 +106,6 @@ def fetch_intraday_series(ticker: str) -> pd.Series:
 
 
 def _first_available_probe(tickers: List[str]) -> tuple[str, pd.Series]:
-    """
-    取れる銘柄が見つかるまで順に試し、最初に取れた intraday を返す
-    """
     last_err: Optional[Exception] = None
     for t in tickers:
         try:
@@ -149,19 +119,12 @@ def _first_available_probe(tickers: List[str]) -> tuple[str, pd.Series]:
 
 
 def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
-    """
-    各銘柄の intraday と 前日終値 から [%] の等ウェイト平均を作る。
-    - 同一日の共通 5 分グリッドに reindex + ffill
-    - クリップで異常値抑制
-    """
     indiv_pct: Dict[str, pd.Series] = {}
 
-    # まず「取れる銘柄」をプローブに採用
     probe_t, probe = _first_available_probe(tickers)
-    day = last_trading_day(probe.index)  # JST の直近取引日
+    day = last_trading_day(probe.index)
     print(f"[INFO] target trading day (JST): {day} (probe={probe_t})")
 
-    # その日のセッション時間帯だけを使う
     def _slice_day(s: pd.Series) -> pd.Series:
         x = s[(s.index.date == day)]
         if x.empty:
@@ -169,12 +132,10 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             x = s[(s.index.date == d2)]
         return x
 
-    # 共通の 5m グリッド（tz は tz_localize を使う）
     grid_start = pd.Timestamp.combine(pd.Timestamp(day), SESSION_START).tz_localize(JST_TZ)
     grid_end   = pd.Timestamp.combine(pd.Timestamp(day), SESSION_END).tz_localize(JST_TZ)
     grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST_TZ)
 
-    # プローブも含めて全銘柄処理
     for t in tickers:
         try:
             s = probe if t == probe_t else fetch_intraday_series(t)
@@ -182,11 +143,9 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
             if s.empty:
                 print(f"[WARN] {t}: no intraday for target day, skip")
                 continue
-
             prev = fetch_prev_close(t, day)
             pct = (s / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
-
             pct = pct.reindex(grid).ffill()
             indiv_pct[t] = pct.rename(t)
         except Exception as e:
@@ -203,12 +162,17 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
 
 def save_ts_pct_csv(series: pd.Series, path: str) -> None:
+    """
+    重要：データが空でも「現在時刻 / pct=0.0」の1行を書き出して、
+    Git 上で確実に変更が検知されるようにする（PNG/TXTと足並みを揃える）。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     if series is None or len(series) == 0:
-        # 空でもヘッダは出す（ワークフローの更新検知を安定化）
-        pd.DataFrame(columns=["ts", "pct"]).to_csv(path, index=False)
-        print("[INFO] wrote CSV header only (no data)")
+        hb_ts = jst_now().strftime("%Y-%m-%dT%H:%M:%S%z")
+        out = pd.DataFrame({"ts": [hb_ts], "pct": [0.0]})
+        out.to_csv(path, index=False)
+        print("[INFO] CSV heartbeat row written (no data)")
         return
 
     s = series.dropna()
@@ -270,7 +234,6 @@ def main():
         print("[INFO] building equal-weight percent series...")
         series = build_equal_weight_pct(tickers)
 
-        # 出力
         save_ts_pct_csv(series, CSV_PATH)
         plot_debug(series, IMG_PATH)
         save_post(series, POST_PATH)
@@ -281,9 +244,8 @@ def main():
             print("[INFO] tail:")
             print(tail)
         else:
-            print("[INFO] series empty")
+            print("[INFO] series empty (heartbeat row only)")
     except Exception as e:
-        # 例外でワークフローが落ちるとコミットが止まるため、ログだけ残して正常終了扱い
         print(f"[FATAL] intraday build failed: {e!r}")
 
 
