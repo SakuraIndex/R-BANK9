@@ -11,39 +11,31 @@ on:
         description: "Run close block once (outside close window)?"
         required: false
         default: "false"
+  # 起動回数は控えめに（1時間に1回）でも、内部で5分刻みに回すので問題なし
   schedule:
-    # 平日5分おき（UTC）— 実行可否はジョブ内でJST判定
-    - cron: "*/5 * * * 1-5"
+    - cron: "0 * * * 1-5"   # UTC基準。JSTの取引時間帯にも毎時起動
 
 permissions:
   contents: write
 
+concurrency:
+  group: auto-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 120   # 1ジョブで最大2時間まで回せるように
+    env:
+      FORCE_INTRADAY: ${{ github.event.inputs.force_intraday == 'true' && '1' || '0' }}
+      FORCE_CLOSE:    ${{ github.event.inputs.force_close    == 'true' && '1' || '0' }}
+      LOOP_INTERVAL_SEC: "300"     # 5分
+      LOOP_MAX_TICKS: "24"         # 5分×24=120分。必要に応じて調整可
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      # 手動入力がない（＝schedule）の場合も安全にフラグを用意
-      - name: Set force flags from inputs (safe for schedule)
-        shell: bash
-        env:
-          INP_FORCE_INTRADAY: ${{ github.event.inputs.force_intraday || 'false' }}
-          INP_FORCE_CLOSE:    ${{ github.event.inputs.force_close    || 'false' }}
-        run: |
-          set -euo pipefail
-          [ "${INP_FORCE_INTRADAY}" = "true" ] && FI=1 || FI=0
-          [ "${INP_FORCE_CLOSE}"    = "true" ] && FC=1 || FC=0
-          {
-            echo "FORCE_INTRADAY=$FI"
-            echo "FORCE_CLOSE=$FC"
-          } | tee -a "$GITHUB_ENV"
+        with: { fetch-depth: 0, persist-credentials: true }
 
       - name: Resolve repo → index settings
         id: resolve
@@ -52,16 +44,11 @@ jobs:
           set -euo pipefail
           REPO_LC="$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
           case "$REPO_LC" in
-            r-bank9)
-              KEY="rbank9"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/rbank9_intraday.py" ;;
-            3_sakura_space)
-              KEY="astra4"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/astra4_intraday.py" ;;
-            s-coin-)
-              KEY="scoin_plus"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/scoin_plus_intraday.py" ;;
-            ain-10)
-              KEY="ain10"; TZ="America/New_York"; S="09:30"; E="16:00"; INTRA="src/ain10_snapshot.py" ;;
-            *)
-              echo "Unknown repo: ${GITHUB_REPOSITORY##*/}"; exit 1 ;;
+            r-bank9) KEY="rbank9"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/rbank9_intraday.py" ;;
+            3_sakura_space) KEY="astra4"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/astra4_intraday.py" ;;
+            s-coin-) KEY="scoin_plus"; TZ="Asia/Tokyo"; S="09:00"; E="15:30"; INTRA="src/scoin_plus_intraday.py" ;;
+            ain-10)  KEY="ain10"; TZ="America/New_York"; S="09:30"; E="16:00"; INTRA="src/ain10_snapshot.py" ;;
+            *) echo "Unknown repo"; exit 1 ;;
           esac
           {
             echo "INDEX_KEY=$KEY"
@@ -73,20 +60,13 @@ jobs:
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
-        shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -U pip
+          pip install -U pip
           pip install -r requirements.txt
-          python - <<'PY'
-          import sys, platform
-          print("=== DIAG ===")
-          print("Python:", sys.version.split()[0], "| Platform:", platform.platform())
-          PY
 
       - name: Compute session flags (DST-aware)
         id: flags
@@ -94,88 +74,83 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          from datetime import datetime, time, timedelta
+          from datetime import datetime, time, timedelta, timezone
           from zoneinfo import ZoneInfo
-          import os
-          tz = ZoneInfo(os.environ.get("MARKET_TZ","Asia/Tokyo"))
-          s_h, s_m = map(int, os.environ.get("SESSION_START","09:00").split(":"))
-          e_h, e_m = map(int, os.environ.get("SESSION_END","15:30").split(":"))
-          now   = datetime.now(tz)
+          import os, sys, json, pathlib
+          tz = ZoneInfo(os.environ["MARKET_TZ"])
+          s_h, s_m = map(int, os.environ["SESSION_START"].split(":"))
+          e_h, e_m = map(int, os.environ["SESSION_END"].split(":"))
+          now = datetime.now(tz)
           start = datetime.combine(now.date(), time(s_h, s_m), tzinfo=tz)
           end   = datetime.combine(now.date(), time(e_h, e_m), tzinfo=tz)
           if end <= start:
               end += timedelta(days=1)
           in_session = start <= now <= end
-          at_close_window = end <= now < end + timedelta(minutes=20)
-
-          # close一度きり実行のガード
+          # 取引終了後も少し余裕を持って回す（データ遅延対策）
+          loop_until = end + timedelta(minutes=15)
+          # close 実行の二重防止フラグ
           last_flag = ""
           try:
-              with open("docs/outputs/_last_run.txt","r",encoding="utf-8") as f:
-                  last_flag = f.read().strip()
+              last_flag = pathlib.Path("docs/outputs/_last_run.txt").read_text(encoding="utf-8").strip()
           except FileNotFoundError:
               pass
           close_key = f"close-{now.date()}"
           already_closed = (last_flag == close_key)
-
-          print(f"[diag] TZ={tz}, now={now}, start={start}, end={end}, in_session={in_session}, at_close={at_close_window}, already_closed={already_closed}")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
-              g.write(f"in_session={'true' if in_session else 'false'}\n")
-              g.write(f"at_close={'true' if at_close_window else 'false'}\n")
-              g.write(f"already_closed={'true' if already_closed else 'false'}\n")
-              g.write(f"close_key={close_key}\n")
+          with open(os.environ["GITHUB_OUTPUT"],"a") as g:
+              print(f"in_session={'true' if in_session else 'false'}", file=g)
+              print(f"loop_until_epoch={int(loop_until.timestamp())}", file=g)
+              print(f"at_close={'true' if now >= end and now < end + timedelta(minutes=20) else 'false'}", file=g)
+              print(f"already_closed={'true' if already_closed else 'false'}", file=g)
           PY
 
-      - name: Run intraday (every 5 min during session OR forced)
+      # === 5分刻みのループ。セッション中は回し続ける。遅延があっても安定更新 ===
+      - name: Run intraday loop (5-min ticks, market-aware)
         if: steps.flags.outputs.in_session == 'true' || env.FORCE_INTRADAY == '1'
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "== intraday (${INDEX_KEY}) =="
-          mkdir -p docs/outputs
-          python "$INTRA_SCRIPT"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/outputs/*intraday.* 2>/dev/null || true
-          git commit -m "chore(intraday): ${INDEX_KEY}" || echo "no intraday changes"
-          git push || true
 
+          LOOP_UNTIL_EPOCH="${{ steps.flags.outputs.loop_until_epoch }}"
+          TICKS="${LOOP_MAX_TICKS}"
+
+          i=1
+          while [ "$i" -le "$TICKS" ]; do
+            now_epoch="$(date +%s)"
+            if [ "$now_epoch" -ge "$LOOP_UNTIL_EPOCH" ] && [ "${FORCE_INTRADAY}" != "1" ]; then
+              echo "Reached loop_until — stop intraday loop."
+              break
+            fi
+
+            echo "== intraday tick $i =="
+            python "$INTRA_SCRIPT" || true
+
+            # 変更があればコミット
+            git add docs/outputs/*intraday.* 2>/dev/null || true
+            git commit -m "chore(intraday): ${INDEX_KEY} tick ${i}" || true
+            git push || true
+
+            # 次の5分まで待機
+            sleep "${LOOP_INTERVAL_SEC}"
+            i=$((i+1))
+          done
+
+      # 取引終了処理（ヒストリ更新や長期チャート）
       - name: Run close tasks (once)
-        if: (steps.flags.outputs.at_close == 'true' && steps.flags.outputs.already_closed != 'true') || env.FORCE_CLOSE == '1'
+        if: (steps.flags.outputs.already_closed != 'true' && steps.flags.outputs.at_close == 'true') || env.FORCE_CLOSE == '1'
         env:
           INDEX_KEY: ${{ env.INDEX_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "== close (${INDEX_KEY}) =="
-          mkdir -p docs/outputs
-          # 当日分を history に反映（存在すれば）
-          if [ -f scripts/update_history.py ]; then
-            python scripts/update_history.py || true
-          fi
-          # 長期チャートと stats
-          if [ -f scripts/long_charts.py ]; then
-            python scripts/long_charts.py || true
-          fi
-          # 1日1回フラグ
-          echo "${{ steps.flags.outputs.close_key }}" > docs/outputs/_last_run.txt
-
+          python scripts/update_history.py || true
+          python scripts/long_charts.py
+          echo "close-$(TZ=${MARKET_TZ} date +%Y-%m-%d)" > docs/outputs/_last_run.txt
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/outputs/* 2>/dev/null || true
           git commit -m "chore(close): ${INDEX_KEY} long charts & stats" || echo "no close changes"
           git push || true
-
-      - name: Upload artifacts (debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rbank9-outputs
-          path: |
-            docs/outputs/*intraday.*
-            docs/outputs/*history*
-            docs/outputs/*_run.txt
-            docs/outputs/*stats*.json
