@@ -55,14 +55,11 @@ _TICKER_RE = re.compile(r"^[A-Za-z0-9=.\-]+$")
 
 def _extract_ticker(line: str) -> Optional[str]:
     """1行から先頭トークン（カンマ/空白/タブ/#まで）を取り出し、ティッカーか判定して返す。"""
-    # コメント除去
     if "#" in line:
         line = line.split("#", 1)[0]
-    # 区切りで先頭トークン
     token = re.split(r"[,\s\t]+", line.strip(), maxsplit=1)[0] if line.strip() else ""
     if not token:
         return None
-    # ざっくり妥当性（Yahooの形式っぽい文字だけ）
     if not _TICKER_RE.match(token):
         return None
     return token
@@ -75,7 +72,7 @@ def load_tickers(path: str) -> List[str]:
             t = _extract_ticker(raw)
             if t:
                 xs.append(t)
-    xs = [x for x in xs if x]  # 念のため
+    xs = [x for x in xs if x]
     if not xs:
         raise RuntimeError(
             "No valid tickers parsed from docs/tickers_rbank9.txt. "
@@ -92,7 +89,6 @@ def _to_series_1d_close(df: pd.DataFrame) -> pd.Series:
     if isinstance(close, pd.Series):
         return pd.to_numeric(close, errors="coerce").dropna()
 
-    # 万一 2D のとき
     d = close.apply(pd.to_numeric, errors="coerce")
     mask = d.notna().any(axis=0)
     d = d.loc[:, mask]
@@ -153,7 +149,7 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     """
     usable: Dict[str, pd.Series] = {}
 
-    # まず、直近取引日を決めるためのプローブ銘柄を探す
+    # プローブ銘柄で直近取引日を決定
     probe_series: Optional[pd.Series] = None
     probe_ticker: Optional[str] = None
     for t in tickers:
@@ -170,9 +166,11 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
     day = last_trading_day(probe_series.index)
     print(f"[INFO] target trading day (JST): {day}  (probe={probe_ticker})")
 
-    # その日の 5m 共通グリッド
-    grid_start = pd.Timestamp.combine(day, SESSION_START, tzinfo=JST)
-    grid_end   = pd.Timestamp.combine(day, SESSION_END,   tzinfo=JST)
+    # その日の 5m 共通グリッド（tz_localize を使う）
+    start_naive = datetime.combine(day, SESSION_START)  # naive
+    end_naive   = datetime.combine(day, SESSION_END)    # naive
+    grid_start = pd.Timestamp(start_naive).tz_localize(JST)
+    grid_end   = pd.Timestamp(end_naive).tz_localize(JST)
     grid = pd.date_range(start=grid_start, end=grid_end, freq=INTRA_INTERVAL, tz=JST)
 
     def _slice_day(s: pd.Series) -> pd.Series:
@@ -192,14 +190,12 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
             prev = fetch_prev_close(t, day)
             if prev is None:
-                # 前日終値が取れない場合は当日先頭値で代替
-                prev = float(intraday.iloc[0])
+                prev = float(intraday.iloc[0])  # 当日先頭値で代替
                 print(f"[INFO] {t}: prev close fallback -> first-of-day {prev}")
 
             pct = (intraday / prev - 1.0) * 100.0
             pct = pct.clip(lower=PCT_CLIP_LOW, upper=PCT_CLIP_HIGH)
 
-            # 共通グリッドに合わせる（前方埋め）
             pct = pct.reindex(grid).ffill()
             usable[t] = pct.rename(t)
         except Exception as e:
@@ -216,7 +212,6 @@ def build_equal_weight_pct(tickers: List[str]) -> pd.Series:
 
 def save_ts_pct_csv(series: pd.Series, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # その時点での全行を書き出し
     out = pd.DataFrame({
         "ts": pd.to_datetime(series.index).tz_convert(JST).astype(str),
         "pct": series.round(4).values
@@ -242,7 +237,7 @@ def plot_debug(series: pd.Series, path: str) -> None:
     ax.set_xlabel("Time", color="white"); ax.set_ylabel("Change vs Prev Close (%)", color="white")
 
     fig.tight_layout()
-    fig.savefig(path, facecolor=fig.getfacecolor(), bbox_inches="tight")
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -274,8 +269,10 @@ def main():
 
     print("[INFO] done.")
     print(f"[INFO] wrote: {CSV_PATH}, {IMG_PATH}, {POST_PATH}")
-    tail = pd.DataFrame({"ts": pd.to_datetime(series.index[-5:]).tz_convert(JST).astype(str),
-                         "pct": series[-5:].round(4).values})
+    tail = pd.DataFrame({
+        "ts": pd.to_datetime(series.index[-5:]).tz_convert(JST).astype(str),
+        "pct": series[-5:].round(4).values
+    })
     print("[INFO] tail:\n", tail.to_string(index=False))
 
 
